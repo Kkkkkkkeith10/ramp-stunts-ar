@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ramp Stunts AR</title>
+<meta name="description" content="Pip's Real-World Lab: Pip stands on your real ramp in AR.">
+<meta name="theme-color" content="#EE8A1F">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<style>
+/* Layout: in play, a transparent overlay over the camera. Pip's speech bubble and the glove at
+   the top, an aiming ring in the middle, the current step in a sheet at the bottom. */
+:root {
+  --bg: #F1F4F2; --surface: #FFFFFF; --ink: #14222C; --muted: #566873; --line: #D3DCD8;
+  --accent: #EE8A1F; --accent-ink: #2A1600; --teal: #0B7A85;
+  --good: #2A8A55; --oops: #C0402C; --helm: #2C4155;
+  --book1: #4C7FB8; --book2: #C85A54;
+  --c-compare: #7A4BD8; --c-split: #D5413A; --c-join: #2E9B58; --c-group: #2D6BD6; --c-repeat: #D9A400;
+  --body: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0E1920; --surface: #16252E; --ink: #E9F0EE; --muted: #96AAB5; --line: #2A3C47;
+    --accent: #F59B3E; --teal: #4CC3CD; --good: #4DBD80; --oops: #EE7A66;
+    --c-compare: #A484F0; --c-repeat: #EDC43A;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0E1920; --surface: #16252E; --ink: #E9F0EE; --muted: #96AAB5; --line: #2A3C47;
+  --accent: #F59B3E; --teal: #4CC3CD; --good: #4DBD80; --oops: #EE7A66;
+  --c-compare: #A484F0; --c-repeat: #EDC43A;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--ink); font: 400 17px/1.45 var(--body); overflow-x: hidden; }
+body.playing { overflow: hidden; background: transparent; }
+canvas#gl { position: fixed; inset: 0; width: 100vw; height: 100vh; display: none; touch-action: none; }
+body.preview canvas#gl { display: block; }
+h1, h2 { font-weight: 800; margin: 0; text-wrap: balance; }
+h1 { font-size: 28px; line-height: 1.1; }
+h2 { font-size: 20px; line-height: 1.2; margin-bottom: 2px; }
+p { margin: 0 0 8px; }
+.muted, .tip { color: var(--muted); }
+.small { font-size: 14px; }
+.warn { color: var(--oops); font-weight: 700; margin: 0; }
+.warn:empty { display: none; }
+.okmsg { color: var(--good); font-weight: 700; margin: 0; }
+
+/* start page */
+.startpage { max-width: 520px; margin: 0 auto; padding: 18px max(16px, env(safe-area-inset-right)) 32px max(16px, env(safe-area-inset-left)); display: grid; gap: 14px; }
+.card0 { background: var(--surface); border: 2px solid var(--line); border-radius: 20px; padding: 16px; display: grid; gap: 10px; }
+.kit { margin: 0; padding-left: 20px; }
+.settings { display: grid; gap: 10px; }
+.settings label { display: grid; grid-template-columns: 1fr 96px; align-items: center; gap: 10px; }
+.settings label.check { grid-template-columns: 28px 1fr; }
+.settings input[type=number] { font: inherit; padding: 8px 10px; border-radius: 10px; border: 2px solid var(--line); background: var(--bg); color: var(--ink); width: 100%; }
+.settings input[type=checkbox] { width: 24px; height: 24px; accent-color: var(--accent); }
+
+/* overlay in play */
+#overlay { position: relative; }
+body.playing #overlay { position: fixed; inset: 0; pointer-events: none; }
+#hud { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: space-between; padding: max(10px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); gap: 8px; }
+.top { display: grid; gap: 6px; pointer-events: auto; }
+.topline { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; }
+.bubble { background: var(--surface); border: 2px solid var(--line); border-radius: 16px; padding: 8px 12px; font-size: 17px; font-weight: 600; min-height: 44px; box-shadow: 0 2px 10px rgba(0,0,0,.18); }
+.glove { display: flex; gap: 4px; flex-wrap: wrap; }
+.finger { --fc: var(--muted); font-size: 12px; font-weight: 700; padding: 3px 8px; border-radius: 999px; background: color-mix(in srgb, var(--surface) 88%, transparent); border: 2px solid var(--line); opacity: .75; }
+.finger.later { opacity: .4; }
+.finger.on { border-color: var(--fc); opacity: 1; }
+.finger.hint { border-color: var(--fc); opacity: 1; box-shadow: 0 0 0 3px color-mix(in srgb, var(--fc) 35%, transparent); animation: nudge 1s ease-in-out infinite; }
+@keyframes nudge { 50% { transform: translateY(-3px); } }
+#cross { position: fixed; left: 50%; top: 50%; width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%; border: 3px dashed rgba(255,255,255,.85); box-shadow: 0 0 0 2px rgba(0,0,0,.25); pointer-events: none; }
+#cross.ok { border-style: solid; border-color: var(--accent); }
+.panel { pointer-events: auto; background: var(--surface); border: 2px solid var(--line); border-radius: 20px; padding: 14px; display: grid; gap: 10px; max-height: 44vh; overflow: auto; box-shadow: 0 4px 18px rgba(0,0,0,.22); }
+
+.btn { font: 700 17px/1.1 var(--body); min-height: 50px; padding: 12px 18px; border-radius: 14px; border: 0; background: var(--accent); color: var(--accent-ink); box-shadow: 0 3px 0 rgba(0, 0, 0, .28); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; text-align: center; }
+.btn:active { transform: translateY(2px); box-shadow: 0 1px 0 rgba(0, 0, 0, .28); }
+.btn.alt { background: var(--surface); color: var(--ink); border: 2px solid var(--line); box-shadow: none; }
+.btn.small { min-height: 40px; font-size: 15px; padding: 8px 12px; }
+.btn[disabled] { opacity: .4; cursor: default; }
+.btn.glow { outline: 3px solid var(--fc, var(--accent)); outline-offset: 3px; animation: ring 1.2s ease-in-out infinite; }
+@keyframes ring { 50% { outline-offset: 6px; } }
+.btn:focus-visible, .link:focus-visible, .opt:focus-visible, summary:focus-visible { outline: 3px solid var(--teal); outline-offset: 3px; }
+.link { background: none; border: 0; color: var(--muted); font: inherit; text-decoration: underline; padding: 8px 4px; cursor: pointer; min-height: 40px; }
+.row { display: grid; gap: 8px; }
+.stepper { display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: 10px; }
+.stepper b { font-size: 28px; min-width: 2ch; text-align: center; font-variant-numeric: tabular-nums; }
+.stepper .btn { min-width: 50px; padding: 8px; font-size: 24px; }
+.stepper .lab { font-weight: 700; }
+.readout { font-weight: 700; margin: 0; }
+.opts { display: grid; gap: 8px; }
+.opt { font: 700 17px var(--body); min-height: 50px; border-radius: 14px; border: 2px solid var(--line); background: var(--surface); color: var(--ink); cursor: pointer; padding: 10px 14px; text-align: left; display: flex; gap: 10px; align-items: center; }
+.opt .dot { width: 14px; height: 14px; border-radius: 50%; flex: none; }
+.opt.right { border-color: var(--good); background: color-mix(in srgb, var(--good) 16%, var(--surface)); }
+.opt.wrong { border-color: var(--oops); }
+.say-ok { color: var(--good); font-weight: 700; margin: 0; }
+.say-no { color: var(--oops); font-weight: 700; margin: 0; }
+.big-statement { font-size: 23px; line-height: 1.2; font-weight: 800; margin: 0; }
+.big-statement.small-statement { font-size: 19px; }
+.big-statement em { font-style: normal; color: var(--c-repeat); }
+.manual summary { cursor: pointer; color: var(--muted); min-height: 40px; display: flex; align-items: center; }
+.manual[open] { display: grid; gap: 8px; }
+.cards { display: grid; gap: 8px; }
+.card { border: 2px solid var(--line); border-radius: 14px; padding: 10px 12px; }
+.card header { display: flex; justify-content: space-between; gap: 8px; }
+.card .big { font-size: 28px; font-weight: 800; margin: 0; line-height: 1.1; }
+.card .big small { font-size: 15px; color: var(--muted); }
+.card p { margin: 0; }
+.card.rec { border-color: var(--accent); }
+.record { font-weight: 700; margin: 0; }
+.log { border: 2px solid var(--line); border-radius: 14px; padding: 2px 12px 10px; font-size: 14px; }
+.log summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; font-weight: 700; gap: 8px; }
+.log summary span { color: var(--muted); font-weight: 400; }
+.log pre { margin: 8px 0 0; padding: 10px; border-radius: 10px; background: var(--bg); font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+.foot { color: var(--muted); font-size: 14px; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="overlay">
+  <section id="start" class="startpage">
+    <header>
+      <h1>Ramp Stunts AR</h1>
+      <p class="muted">Pip's Real-World Lab · AR prototype</p>
+    </header>
+    <div class="card0">
+      <h2>Today's stunt</h2>
+      <p>Pip stands on your real floor and climbs your real ramp. Your real car does the stunt.</p>
+      <ul class="kit"><li>A few books</li><li>A tray or board for the ramp</li><li>A toy car</li><li>A shoe, to measure with</li></ul>
+      <p class="tip small">A grown-up should stay close. Hold the phone, or stand it up so both hands are free.</p>
+      <button class="btn" id="xrBtn" data-act="startXR" disabled>Start AR</button>
+      <p id="xrStatus" class="muted small">Checking for AR...</p>
+      <button class="btn alt" data-act="startPreview">Try without AR (preview)</button>
+    </div>
+    <details class="card0">
+      <summary><b>Grown-up settings</b></summary>
+      <div class="settings">
+        <label>Length of the measuring shoe (cm) <input id="setShoe" type="number" min="10" max="35" step="0.5" inputmode="decimal"></label>
+        <label>Thickness of one book (cm) <input id="setBook" type="number" min="0.5" max="8" step="0.5" inputmode="decimal"></label>
+        <label class="check"><input id="setVoice" type="checkbox"> Pip talks out loud</label>
+      </div>
+    </details>
+    <div id="startLog"></div>
+    <p class="foot">The camera picture stays on this phone. Nothing is uploaded or recorded.</p>
+  </section>
+
+  <div id="hud" hidden>
+    <div class="top">
+      <div class="topline">
+        <div class="bubble" id="bubble" aria-live="polite"></div>
+        <button class="btn alt small" data-act="exit">Exit</button>
+      </div>
+      <nav class="glove" id="glove" aria-label="Pip's glove"></nav>
+    </div>
+    <div id="cross" hidden></div>
+    <main class="panel" id="panel"></main>
+  </div>
+</div>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

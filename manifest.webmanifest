@@ -1,0 +1,16 @@
+{
+  "name": "Ramp Stunts AR",
+  "short_name": "Ramp Stunts",
+  "description": "Pip's Real-World Lab: Pip stands on your real ramp in AR.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "background_color": "#F1F4F2",
+  "theme_color": "#EE8A1F",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
