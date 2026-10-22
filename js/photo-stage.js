@@ -1,0 +1,410 @@
+// Pip's Photo Stage: one photo, depth from Depth Anything V2 Small on this device, and Pip
+// running around inside the photo in 3D. No AR session, no tracking, no floor scanning.
+//
+// The photo becomes a 3D surface built from the camera's own viewpoint, so from the "photo
+// view" it lines up exactly with the photo, and nearer real things hide Pip. Pip lives in a
+// floor frame (y along the fitted floor normal) so his hops stay upright.
+import { THREE, makePip, applyPipPose, makeCar, placeCar, makeLabel } from './scene.js';
+import { createPip, play, pose, settle } from './pip-anim.js';
+import { makeCamera, createSurface, fitFloor, floorFrame, surfacePath, DEFAULTS } from './photo-geom.js';
+import { pipeline, env, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+
+const $ = (s) => document.querySelector(s);
+const nowSec = () => performance.now() / 1000;
+const MODEL = 'onnx-community/depth-anything-v2-small';
+const MAX_SIDE = 640;
+const HOP = 0.06; // metres per hop at Pip's normal size (sizes are a guess, see photo-geom.js)
+env.allowLocalModels = false;
+
+const tech = { backend: '', loadS: 0, depthS: 0, floor: null };
+function status(text, cls) { const s = $('#status'); s.textContent = text; s.className = cls || ''; }
+function say(text) {
+  $('#bubble').textContent = text;
+  if (window.speechSynthesis) {
+    try { speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.pitch = 1.35; speechSynthesis.speak(u); } catch (e) { /* no voice */ }
+  }
+}
+function showTech() {
+  const f = tech.floor;
+  $('#tech').textContent = 'Depth model ' + tech.backend + ', loaded in ' + tech.loadS.toFixed(1) + ' s, depth in ' + tech.depthS.toFixed(2) + ' s. ' +
+    (f ? 'Floor fit ' + Math.round(f.share * 100) + '% of the lower photo' + (f.ok ? '' : ' (weak, so "up" may be off)') +
+      ', normal ' + [f.n.x, f.n.y, f.n.z].map((v) => v.toFixed(2)).join(' ') + '.' : '');
+}
+
+// ---------- the depth model ----------
+
+let estimator = null;
+async function loadModel() {
+  const hasGPU = !!(navigator.gpu && await navigator.gpu.requestAdapter().catch(() => null));
+  tech.backend = hasGPU ? 'webgpu' : 'wasm';
+  status('Pip is learning to see (downloading the depth model, ' + (hasGPU ? '50' : '27') + ' MB the first time)...');
+  const t0 = performance.now();
+  let last = -1;
+  estimator = await pipeline('depth-estimation', MODEL, {
+    device: tech.backend, dtype: hasGPU ? 'fp16' : 'q8',
+    progress_callback: (p) => {
+      if (p.status === 'progress' && p.total) {
+        const pct = Math.round(p.loaded / p.total * 100);
+        if (pct !== last) { last = pct; status('Pip is learning to see: ' + pct + '%'); }
+      }
+    }
+  });
+  tech.loadS = (performance.now() - t0) / 1000;
+  status('Ready. Take or choose a photo.', 'ok');
+}
+
+// ---------- photo in, depth out ----------
+
+// Shrink big phone photos first: faster, and the model works at about 518 px anyway.
+async function shrink(url) {
+  const img = new Image();
+  img.src = url;
+  await img.decode();
+  const k = Math.min(1, MAX_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.9));
+  return { canvas: c, url: URL.createObjectURL(blob), w: c.width, h: c.height };
+}
+
+let photo = null, depth = null;
+async function usePhoto(url) {
+  if (!estimator) { status('Pip is still learning to see. Try again in a moment.'); return; }
+  status('Pip is looking at your photo...');
+  say('Ooh, let me look...');
+  photo = await shrink(url);
+  const image = await RawImage.read(photo.url);
+  const t0 = performance.now();
+  depth = (await estimator(image)).depth;
+  tech.depthS = (performance.now() - t0) / 1000;
+  buildStage();
+  status('Done.', 'ok');
+  $('#pick').hidden = true;
+  $('#stagebox').hidden = false;
+  $('#controls').hidden = false;
+  $('#stagebox').scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+// ---------- three.js stage ----------
+
+const canvas = $('#stage');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0E1920);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a7f6a, 1.7));
+const sun = new THREE.DirectionalLight(0xffffff, 1.3);
+sun.position.set(0.5, 1, 0.8);
+scene.add(sun);
+const camera = new THREE.PerspectiveCamera(50, 4 / 3, 0.02, 30);
+
+let surface = null, frame = null, mesh = null, floorGroup = null, pipModel = null;
+let pipA = null, pipPx = null, hopRun = null, carRun = null, ramp = null, mode = 'walk';
+const view = { yaw: 0, pitch: 0, pivot: new THREE.Vector3(0, 0, -1.5) };
+const labels = [];
+
+function settingsNow() {
+  return { size: Number($('#size').value) / 100, depthAmt: Number($('#depthAmt').value) / 100 };
+}
+
+function buildStage() {
+  const { size, depthAmt } = settingsNow();
+  const cam = makeCamera(photo.w, photo.h);
+  const far = DEFAULTS.near + (DEFAULTS.far - DEFAULTS.near) * depthAmt;
+  surface = createSurface(depth, cam, { near: DEFAULTS.near, far });
+  tech.floor = fitFloor(surface);
+  frame = floorFrame(tech.floor.n);
+
+  // clear the old stage
+  [mesh, floorGroup].forEach((o) => { if (o) scene.remove(o); });
+  labels.length = 0; ramp = null; carRun = null; hopRun = null;
+  $('#carBtn').disabled = true;
+
+  // the photo as a surface: a grid of points pushed out to their guessed distance
+  const segX = 160, segY = Math.max(2, Math.round(segX * photo.h / photo.w));
+  const pos = new Float32Array((segX + 1) * (segY + 1) * 3), uv = new Float32Array((segX + 1) * (segY + 1) * 2);
+  const col = new Float32Array((segX + 1) * (segY + 1) * 3), idx = [];
+  for (let j = 0; j <= segY; j++) for (let i = 0; i <= segX; i++) {
+    const k = j * (segX + 1) + i, px = i / segX * photo.w, py = j / segY * photo.h, p = surface.point(px, py);
+    pos.set([p.x, p.y, p.z], k * 3);
+    uv.set([i / segX, 1 - j / segY], k * 2);
+    const t = surface.dispAt(px, py);
+    col.set([0.05 + 0.9 * t, 0.2 + 0.5 * t * (1 - t) * 2, 0.55 * (1 - t) + 0.1], k * 3);
+    if (i < segX && j < segY) idx.push(k, k + segX + 1, k + 1, k + 1, k + segX + 1, k + segX + 2);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  geo.setIndex(idx);
+  const tex = new THREE.CanvasTexture(photo.canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide }));
+  mesh.userData.tex = tex;
+  scene.add(mesh);
+  applyShowDepth();
+
+  // Pip's world: axes standing on the fitted floor
+  floorGroup = new THREE.Group();
+  floorGroup.matrixAutoUpdate = false;
+  const v = (a) => new THREE.Vector3(a.x, a.y, a.z);
+  floorGroup.matrix.makeBasis(v(frame.right), v(frame.up), v(frame.back));
+  scene.add(floorGroup);
+  pipModel = makePip();
+  pipModel.scale.setScalar(size);
+  floorGroup.add(pipModel);
+
+  // the camera: the photo's own viewpoint, with a little tilt around the middle of the photo
+  camera.fov = 2 * Math.atan((photo.h / 2) / cam.fy) * 180 / Math.PI;
+  camera.aspect = photo.w / photo.h;
+  camera.updateProjectionMatrix();
+  const mid = surface.point(photo.w / 2, photo.h / 2);
+  view.pivot.set(mid.x, mid.y, mid.z);
+  view.yaw = 0; view.pitch = 0;
+  sizeCanvas();
+
+  // Pip drops in near the bottom middle of the photo, on the floor
+  pipPx = [photo.w * 0.5, photo.h * 0.86];
+  const land = local(surface.point(pipPx[0], pipPx[1]));
+  pipA = createPip(land);
+  const cam0 = local({ x: 0, y: 0, z: 0 });
+  pipModel.rotation.y = Math.atan2(cam0.x - land.x, cam0.z - land.z); // start facing the child
+  const up = 0.35 * size;
+  hopAlong([{ x: land.x, y: land.y + up, z: land.z }, land], { hopSec: 0.55, hopHeight: 0 }, () => say("Wheee! I'm in your photo! Tap the floor and I'll hop there."));
+  mode = 'walk';
+  setTag('Tap the floor to move Pip');
+  showTech();
+}
+
+const local = (p) => frame.toLocal(p);
+
+function sizeCanvas() {
+  if (!photo) return;
+  const w = canvas.clientWidth || 360;
+  const h = Math.min(window.innerHeight * 0.68, w * photo.h / photo.w);
+  canvas.style.height = h + 'px';
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', sizeCanvas);
+
+function applyShowDepth() {
+  if (!mesh) return;
+  const show = $('#showDepth').checked;
+  mesh.material.map = show ? null : mesh.userData.tex;
+  mesh.material.vertexColors = show;
+  mesh.material.needsUpdate = true;
+}
+
+// ---------- Pip moves ----------
+
+function hopAlong(path, opts, onDone, onStep) {
+  const { size } = settingsNow();
+  if (path.length < 2) { if (onDone) onDone(); return; }
+  play(pipA, 'hop', nowSec(), { path, hopSec: opts.hopSec || 0.38, hopHeight: opts.hopHeight != null ? opts.hopHeight : 0.045 * size });
+  hopRun = { counted: 0, onDone, onStep };
+}
+
+// A path over the photo's surface from one pixel to another, as Pip-frame points.
+function pathTo(fromPx, toPx, maxHops = 28) {
+  const { size } = settingsNow();
+  let step = HOP * size, pts = surfacePath(surface, fromPx, toPx, step);
+  if (pts.length > maxHops + 1) pts = surfacePath(surface, fromPx, toPx, step * (pts.length - 1) / maxHops);
+  return pts.map(local);
+}
+
+function walkTo(px) {
+  if (hopRun) return;
+  const path = pathTo(pipPx, px);
+  say(path.length > 12 ? 'That is far! Hop, hop, hop...' : 'Hop!');
+  hopAlong(path, {}, () => { pipPx = px; say(['Here!', 'Made it!', 'Tap somewhere else!'][Math.floor(Math.random() * 3)]); });
+}
+
+function addLabel(text, p, color = '#8a6500') {
+  const { size } = settingsNow();
+  const s = makeLabel(text, { color, height: 0.035 * Math.max(0.7, size) });
+  s.position.set(p.x, p.y + 0.15 * size, p.z);
+  floorGroup.add(s);
+  labels.push(s);
+  return s;
+}
+function clearLabels() { labels.splice(0).forEach((s) => floorGroup.remove(s)); }
+
+function marker(p, color) {
+  const { size } = settingsNow();
+  const m = new THREE.Mesh(new THREE.SphereGeometry(0.012 * size, 16, 12), new THREE.MeshBasicMaterial({ color, depthTest: false }));
+  m.position.set(p.x, p.y + 0.005, p.z);
+  m.renderOrder = 15;
+  floorGroup.add(m);
+  labels.push(m);
+}
+
+// ---------- the ramp: tap the bottom, then the top; Pip climbs and counts ----------
+
+function rampTap(px) {
+  if (mode === 'rampBottom') {
+    clearLabels();
+    ramp = { bottomPx: px };
+    marker(local(surface.point(px[0], px[1])), 0x0B7A85);
+    mode = 'rampTop';
+    setTag('Now tap the top of the ramp');
+    say('And where is the top?');
+    return;
+  }
+  ramp.topPx = px;
+  marker(local(surface.point(px[0], px[1])), 0xD9A400);
+  mode = 'busy';
+  setTag('Watch Pip climb');
+  say('Here I go!');
+  hopAlong(pathTo(pipPx, ramp.bottomPx), {}, () => {
+    pipPx = ramp.bottomPx;
+    const climb = pathTo(ramp.bottomPx, ramp.topPx, 16);
+    hopAlong(climb, { hopSec: 0.5 }, () => {
+      pipPx = ramp.topPx;
+      const a = climb[0], b = climb[climb.length - 1];
+      ramp.hops = climb.length - 1;
+      ramp.bottom = a; ramp.top = b;
+      ramp.rise = b.y - a.y;
+      ramp.run = Math.hypot(b.x - a.x, b.z - a.z);
+      say(ramp.hops + ' hops to the top! ' + (ramp.rise > 0.01 ? 'It goes up as it goes across.' : 'Hmm, that looked flat to me.'));
+      mode = 'walk';
+      setTag('Tap the floor to move Pip');
+      $('#carBtn').disabled = false;
+      showTech();
+      $('#tech').textContent += ' Ramp guess: ' + Math.round(ramp.run * 100) + ' cm across, ' + Math.round(ramp.rise * 100) + ' cm up, ' +
+        Math.round(Math.atan2(ramp.rise, ramp.run) * 180 / Math.PI) + ' degrees (scale is a guess).';
+    }, (k) => addLabel(String(k), climb[k]));
+  });
+}
+
+// ---------- Pip's ghost car: down the ramp and along the floor beyond it ----------
+
+function ghostCar() {
+  if (!ramp || !ramp.top || carRun) return;
+  const { size } = settingsNow();
+  // keep going past the bottom, the same way, for twice the ramp's length (in the photo)
+  const dx = ramp.bottomPx[0] - ramp.topPx[0], dy = ramp.bottomPx[1] - ramp.topPx[1];
+  const endPx = [
+    Math.min(photo.w - 2, Math.max(2, ramp.bottomPx[0] + dx * 2)),
+    Math.min(photo.h - 2, Math.max(2, ramp.bottomPx[1] + dy * 2))
+  ];
+  const down = surfacePath(surface, ramp.topPx, ramp.bottomPx, 0.01).map(local);
+  const on = surfacePath(surface, ramp.bottomPx, endPx, 0.01).map(local);
+  const pts = down.concat(on.slice(1));
+  const len = [0];
+  for (let i = 1; i < pts.length; i++) len.push(len[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y, pts[i].z - pts[i - 1].z));
+  const car = makeCar(0xEE8A1F, true);
+  car.scale.setScalar(size);
+  floorGroup.add(car);
+  carRun = { car, pts, len, rampLen: len[down.length - 1], start: nowSec(), dur: 2.6 };
+  say('Watch my bet... vroom!');
+}
+
+function carAt(c, s) {
+  let i = 1;
+  while (i < c.len.length - 1 && c.len[i] < s) i++;
+  const a = c.pts[i - 1], b = c.pts[i], seg = Math.max(1e-6, c.len[i] - c.len[i - 1]), t = Math.min(1, Math.max(0, (s - c.len[i - 1]) / seg));
+  const p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z + (b.z - a.z) * t };
+  const flat = Math.hypot(b.x - a.x, b.z - a.z) || 1e-6;
+  return { p, dir: { x: (b.x - a.x) / flat, y: 0, z: (b.z - a.z) / flat }, pitch: Math.atan2(b.y - a.y, flat) * 180 / Math.PI };
+}
+
+// ---------- input: drag to tilt, tap to act ----------
+
+const ray = new THREE.Raycaster();
+let press = null;
+canvas.addEventListener('pointerdown', (e) => { press = { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, t: performance.now(), moved: 0 }; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointermove', (e) => {
+  if (!press) return;
+  press.moved += Math.abs(e.clientX - press.lx) + Math.abs(e.clientY - press.ly);
+  if (press.moved > 10) {
+    view.yaw = Math.max(-0.55, Math.min(0.55, view.yaw - (e.clientX - press.lx) * 0.005));
+    view.pitch = Math.max(-0.45, Math.min(0.45, view.pitch - (e.clientY - press.ly) * 0.005));
+  }
+  press.lx = e.clientX; press.ly = e.clientY;
+});
+canvas.addEventListener('pointerup', (e) => {
+  const p = press; press = null;
+  if (!p || p.moved > 10 || !mesh) return;
+  const r = canvas.getBoundingClientRect();
+  ray.setFromCamera({ x: (e.clientX - r.left) / r.width * 2 - 1, y: -((e.clientY - r.top) / r.height) * 2 + 1 }, camera);
+  const hit = ray.intersectObject(mesh, false)[0];
+  if (!hit) return;
+  tapPixel(surface.pixelOf(hit.point));
+});
+canvas.addEventListener('pointercancel', () => { press = null; });
+
+function tapPixel(px) {
+  if (mode === 'walk') walkTo(px);
+  else if (mode === 'rampBottom' || mode === 'rampTop') rampTap(px);
+}
+
+function setTag(t) { $('#tag').textContent = t; }
+
+$('#rampBtn').addEventListener('click', () => {
+  if (hopRun) return;
+  mode = 'rampBottom';
+  setTag('Tap the bottom of the ramp');
+  say('Show me your ramp! Tap the bottom first.');
+});
+$('#carBtn').addEventListener('click', ghostCar);
+$('#homeBtn').addEventListener('click', () => { view.yaw = 0; view.pitch = 0; });
+$('#newBtn').addEventListener('click', () => {
+  $('#pick').hidden = false; $('#stagebox').hidden = true; $('#controls').hidden = true;
+  say('New photo? Show me!');
+});
+$('#size').addEventListener('change', () => { if (photo) buildStage(); });
+$('#depthAmt').addEventListener('change', () => { if (photo) buildStage(); });
+$('#showDepth').addEventListener('change', applyShowDepth);
+
+['#cam', '#lib'].forEach((id) => $(id).addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (f) usePhoto(URL.createObjectURL(f)).catch(fail);
+  e.target.value = '';
+}));
+$('#sample').addEventListener('click', () => usePhoto('sample-ramp.jpg').catch(fail));
+function fail(err) { status('Something went wrong: ' + (err && err.message ? err.message : err), 'err'); console.error(err); }
+
+// ---------- per frame ----------
+
+function step() {
+  const now = nowSec();
+  if (mesh) {
+    // orbit the photo's middle; at yaw = pitch = 0 the camera is exactly where the photo was taken
+    const d = view.pivot.length();
+    const dir = new THREE.Vector3(Math.sin(view.yaw) * Math.cos(view.pitch), Math.sin(view.pitch), Math.cos(view.yaw) * Math.cos(view.pitch));
+    camera.position.copy(view.pivot).addScaledVector(dir, d);
+    camera.lookAt(view.pivot);
+
+    if (pipA) {
+      const p = pose(pipA, now);
+      if (hopRun) {
+        while (hopRun.counted < p.step) { hopRun.counted++; if (hopRun.onStep) hopRun.onStep(hopRun.counted); }
+        if (p.done) { const h = hopRun; hopRun = null; settle(pipA, now); if (h.onDone) h.onDone(); }
+      } else if (p.done) settle(pipA, now);
+      applyPipPose(pipModel, pose(pipA, now), local(camera.position));
+    }
+
+    if (carRun) {
+      const c = carRun, u = Math.min(1, (now - c.start) / c.dur), total = c.len[c.len.length - 1];
+      // speed up down the ramp, then slow to a stop
+      const s = u < 0.35 ? (u / 0.35) ** 2 * c.rampLen : c.rampLen + (1 - (1 - (u - 0.35) / 0.65) ** 2) * (total - c.rampLen);
+      const at = carAt(c, Math.min(total, s));
+      placeCar(c.car, at.p, at.dir, at.pitch);
+      if (u >= 1 && now - c.start > c.dur + 1.5) { floorGroup.remove(c.car); carRun = null; }
+    }
+    renderer.render(scene, camera);
+  }
+}
+function loop() { step(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+
+loadModel().catch(fail);
+
+// For headless tests.
+window.__stage = {
+  usePhoto, tapPixel, get ready() { return !!estimator; }, get mode() { return mode; }, get busy() { return !!hopRun || !!carRun; },
+  get ramp() { return ramp; }, get pipPx() { return pipPx; }, tech, ghostCar, frames(n = 1) { for (let i = 0; i < n; i++) step(); }
+};

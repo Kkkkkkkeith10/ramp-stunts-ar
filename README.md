@@ -4,6 +4,19 @@ Live: https://kkkkkkkeith10.github.io/ramp-stunts-ar/ (repo: https://github.com/
 
 Pip stands on the real floor, climbs the real ramp, bets with a ghost car, and hops along the ramp to count it. WebXR in Android Chrome, built with three.js 0.160.0 (vendored in `vendor/`, MIT licence). No backend, no build step.
 
+## Pip's Photo Stage (`stage/`): the no-AR alternative
+
+One photo, no tracking. Depth Anything V2 Small (Apache-2.0, via Transformers.js 3.8.1) guesses depth on the device. The photo is not uploaded; the model (27 MB, or 50 MB with WebGPU) downloads once from Hugging Face. The photo becomes a 3D surface seen from the camera's own viewpoint, so it lines up with the photo and nearer real things hide Pip.
+
+- The floor is fitted (RANSAC) in the lower part of the photo, so Pip stands upright.
+- Tap anywhere: Pip hops there over the surface. "Show Pip the ramp": tap its bottom, then its top, and Pip climbs, counting hops. "Pip's ghost car" rolls down the ramp and across the floor.
+- Drag to tilt the stage a little. Far tilts stretch the picture: the model only sees the front of things.
+- Logic is in `js/photo-geom.js`, tested in `tests/photo-geom.test.js`. `stage/sample-ramp.jpg` is a render from the AR preview's pretend room, not a real photo.
+- Checked on the sample: depth in about 1.5 s with WebGPU on a laptop, the floor fit recovered the camera tilt (31 degrees found, about 33 real). Not yet checked on a phone or on real photos.
+- **Known weakness:** the model gives relative depth only, so distances use a guessed near/far range. Shapes and hop paths look right, but slopes come out too flat (the sample's 11 degree ramp read as 1 degree). Fix to try next: use the phone's tilt sensor at photo time, or the book count, to calibrate the depth.
+
+`depth/` is the plain depth test: photo, depth map and a tiltable 3D version.
+
 ## What it does
 
 | Step | What happens | Tier |

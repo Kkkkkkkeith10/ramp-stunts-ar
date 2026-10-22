@@ -1,5 +1,5 @@
 // Offline support: try the network first so updates show up, fall back to the saved copy.
-const CACHE = 'ramp-stunts-ar-v3';
+const CACHE = 'ramp-stunts-ar-v4';
 const FILES = [
   './', './index.html', './manifest.webmanifest',
   './js/main.js', './js/scene.js', './js/ramp.js', './js/pip-anim.js', './js/rules.js', './js/events.js',

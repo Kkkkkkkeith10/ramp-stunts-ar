@@ -2,5 +2,5 @@
   "name": "ramp-stunts-ar",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node --test tests/logic.test.js" }
+  "scripts": { "test": "node --test tests/logic.test.js tests/photo-geom.test.js" }
 }

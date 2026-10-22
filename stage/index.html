@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pip's Photo Stage</title>
+<meta name="description" content="Take one photo of your ramp; Pip runs around inside it in 3D. Depth is worked out on this device.">
+<style>
+/* Layout: one phone column. Pip's speech bubble, the photo stage (the photo turned 3D), then the controls. */
+:root {
+  --bg: #F1F4F2; --surface: #FFFFFF; --ink: #14222C; --muted: #566873; --line: #D3DCD8;
+  --accent: #EE8A1F; --accent-ink: #2A1600; --good: #2A8A55; --oops: #C0402C; --repeat: #D9A400;
+  --body: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #0E1920; --surface: #16252E; --ink: #E9F0EE; --muted: #96AAB5; --line: #2A3C47; --accent: #F59B3E; --good: #4DBD80; --oops: #EE7A66; --repeat: #EDC43A; color-scheme: dark; }
+}
+:root[data-theme="dark"] { --bg: #0E1920; --surface: #16252E; --ink: #E9F0EE; --muted: #96AAB5; --line: #2A3C47; --accent: #F59B3E; --good: #4DBD80; --oops: #EE7A66; --repeat: #EDC43A; color-scheme: dark; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 400 16px/1.45 var(--body); }
+.wrap { max-width: 680px; margin: 0 auto; padding: 12px max(16px, env(safe-area-inset-right)) 28px max(16px, env(safe-area-inset-left)); display: grid; gap: 10px; }
+h1 { font-size: 22px; margin: 0; }
+h2 { font-size: 17px; margin: 0; }
+p { margin: 0; }
+.muted { color: var(--muted); }
+.small { font-size: 14px; }
+.bubble { background: var(--surface); border: 2px solid var(--line); border-radius: 16px; padding: 8px 12px; font-weight: 600; min-height: 44px; }
+.card { background: var(--surface); border: 2px solid var(--line); border-radius: 16px; padding: 12px; display: grid; gap: 8px; min-width: 0; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.btn { font: 700 16px/1.1 var(--body); min-height: 48px; padding: 10px 12px; border-radius: 12px; border: 0; background: var(--accent); color: var(--accent-ink); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; text-align: center; }
+.btn.alt { background: var(--surface); color: var(--ink); border: 2px solid var(--line); }
+.btn.on { outline: 3px solid var(--repeat); outline-offset: 2px; }
+.btn[disabled] { opacity: .45; cursor: default; }
+#status { font-weight: 700; }
+#status.err { color: var(--oops); }
+#status.ok { color: var(--good); }
+.stagebox { position: relative; }
+#stage { width: 100%; border-radius: 14px; background: #0E1920; touch-action: none; display: block; }
+.tag { position: absolute; left: 8px; top: 8px; background: rgba(0,0,0,.55); color: #fff; font-size: 13px; padding: 3px 8px; border-radius: 999px; pointer-events: none; }
+label.slider { display: grid; grid-template-columns: 7.5em 1fr; gap: 10px; align-items: center; font-size: 14px; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+details summary { cursor: pointer; color: var(--muted); min-height: 40px; display: flex; align-items: center; }
+details[open] { display: grid; gap: 8px; }
+#tech { font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; color: var(--muted); word-break: break-word; }
+a { color: inherit; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Pip's Photo Stage</h1>
+    <p class="muted small">One photo becomes a 3D stage for Pip. Depth is worked out on this phone; the photo is not uploaded.</p>
+  </header>
+
+  <div class="bubble" id="bubble" aria-live="polite">Hi, I'm Pip! Take a photo of your ramp and I'll jump in.</div>
+
+  <section class="card" id="pick">
+    <div class="row">
+      <label class="btn" for="cam">Take a photo</label>
+      <label class="btn alt" for="lib">Choose a photo</label>
+    </div>
+    <input id="cam" type="file" accept="image/*" capture="environment" hidden>
+    <input id="lib" type="file" accept="image/*" hidden>
+    <button class="btn alt" id="sample">Use the sample ramp</button>
+    <p class="muted small">Best photo: phone on a stand, side on to the ramp, about 1 m away, floor in the bottom half, good light.</p>
+    <p id="status" aria-live="polite">Loading...</p>
+  </section>
+
+  <section class="stagebox" id="stagebox" hidden>
+    <canvas id="stage"></canvas>
+    <span class="tag" id="tag">Tap the floor to move Pip</span>
+  </section>
+
+  <section class="card" id="controls" hidden>
+    <div class="row">
+      <button class="btn" id="rampBtn">Show Pip the ramp</button>
+      <button class="btn alt" id="carBtn" disabled>Pip's ghost car</button>
+    </div>
+    <div class="row">
+      <button class="btn alt" id="homeBtn">Back to the photo view</button>
+      <button class="btn alt" id="newBtn">New photo</button>
+    </div>
+    <p class="muted small">Drag to tilt the stage. Tap to move Pip. Nearer real things hide him.</p>
+    <details>
+      <summary>Grown-up settings and tech info</summary>
+      <label class="slider">Pip size <input id="size" type="range" min="40" max="250" value="100"></label>
+      <label class="slider">Depth <input id="depthAmt" type="range" min="20" max="200" value="100"></label>
+      <label class="slider">Show depth <input id="showDepth" type="checkbox"></label>
+      <p id="tech"></p>
+    </details>
+  </section>
+  <p class="muted small"><a href="../">Back to Ramp Stunts AR</a></p>
+</div>
+<script type="module" src="../js/photo-stage.js"></script>
+</body>
+</html>
