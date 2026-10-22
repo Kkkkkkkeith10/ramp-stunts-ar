@@ -46,7 +46,9 @@ root.add(pipModel);
 const pops = makePops(root);
 
 let mode = null, session = null, hitSource = null, anchor = null, pretend = null;
-const aim = { ok: false, matrix: new THREE.Matrix4(), hit: null };
+const aim = { ok: false, matrix: new THREE.Matrix4(), hit: null, virtual: false };
+// What the AR session is doing, for the diagnostics line and the guessed-floor fallback.
+const xr = { frames: 0, pose: false, hitFrames: 0, space: 'local', feats: null, floorSpace: false, floorY: null, camY: 0 };
 const objs = { ramp: null, flags: {}, ghost: null, car: null, blocks: [], marks: [] };
 let pipA = createPip(R.vec(0, 0, 0));
 let hopRun = null, carRuns = [];
@@ -201,11 +203,26 @@ const LIMITS = { books: [1, 6], across: [2, 8], bet: [0, MAX_SHOES], manual: [0,
 
 const screens = {};
 
+// The phone finds the floor by seeing the same floor details (grain, pattern) from slightly
+// different places as it moves, so the coaching asks for a slow sweep, light and a patterned floor.
 screens.place = {
-  html: () => '<h2>Find the floor</h2><p>Point the phone at the floor near your ramp. Move it slowly until the ring sits on the floor.</p>' +
-    '<button class="btn" data-act="place" data-needs-aim>Put Pip here</button>',
-  enter() { S.aiming = true; say('idle', "Hi, I'm Pip! Show me the floor so I can stand on it."); }
+  html: () => '<h2>Help Pip find the floor</h2>' +
+    '<p class="readout" id="floorTxt">Looking for the floor...</p>' +
+    '<button class="btn" data-act="place" data-needs-aim>Put Pip here</button>' +
+    (mode === 'xr' ? '<button class="btn alt" data-act="placeGuess" id="guessBtn" hidden>Still nothing? Let Pip guess the floor</button>' : '') +
+    '<div class="coach" aria-hidden="true"><div class="coach-phone"></div><div class="coach-floor"></div></div>' +
+    '<ol class="steps"><li>Point the phone at the floor, one big step in front of you.</li>' +
+    '<li>Sweep it slowly left and right, like a torch.</li>' +
+    '<li>When the circle turns orange, tap the button.</li></ol>' +
+    '<p class="diag" id="diag"></p>',
+  enter() { S.aiming = true; S.placeStart = nowSec(); say('idle', "Hi, I'm Pip! Sweep the phone slowly over the floor so I can find it."); }
 };
+
+function floorHint(t) {
+  if (aim.ok) return aim.virtual ? 'Pip is guessing the floor. Tap Put Pip here.' : 'Found the floor! Tap Put Pip here.';
+  if (t < 8) return 'Looking for the floor... keep sweeping slowly.';
+  return 'Still looking. Try more light, or a floor with a pattern, like a rug or wood. Plain shiny floors are hard.';
+}
 
 screens.build = {
   html: () => '<h2>Build your ramp</h2>' +
@@ -493,9 +510,16 @@ const acts = {
     }
     pipA = createPip(R.vec(0, 0, 0));
     pipModel.visible = true;
-    log.add('pip_placed', { mode, anchored: mode === 'xr' && !!(aim.hit && aim.hit.createAnchor) });
+    log.add('pip_placed', { mode, anchored: mode === 'xr' && !!(aim.hit && aim.hit.createAnchor), floor: aim.virtual ? 'guessed' : 'found' });
     go('build');
     say('happy', 'Here I am, on your floor! Walk around me.');
+  },
+  // Fallback when the phone finds no surface: aim at a flat floor at a guessed height
+  // (the browser's floor estimate if it gives one, else 1.1 m below where the phone is now).
+  placeGuess() {
+    xr.floorY = xr.floorSpace ? 0 : xr.camY - 1.1;
+    log.add('ar_session', { mode: 'webxr', floor_guess: xr.floorSpace ? 'local-floor' : 'camera_minus_1.1m' });
+    say('think', 'I will guess where the floor is. Point at the floor and tap Put Pip here.');
   },
   makeNumbers() {
     if (!S.numFrame) S.numFrame = { foot: R.vec(pipA.pos.x, 0, pipA.pos.z), dir: R.sideDir(cameraForwardLocal()) };
@@ -662,6 +686,17 @@ function tick() {
     const f = objs.flags[k];
     if (f) f.position.y = f.userData.base + (S.pulse === k ? Math.abs(Math.sin(now * 5)) * 0.03 : 0);
   });
+  // floor coaching and grown-up diagnostics on the first screen
+  if (S.screen === 'place' && now - (S.diagAt || 0) > 0.4) {
+    S.diagAt = now;
+    const t = now - S.placeStart, ft = $('#floorTxt'), g = $('#guessBtn'), dg = $('#diag');
+    if (ft) ft.textContent = floorHint(t);
+    if (g) g.hidden = !(t > 12 && !aim.ok && xr.floorY == null);
+    if (dg) dg.textContent = mode === 'xr'
+      ? 'Tech info: frames ' + xr.frames + ', phone tracked ' + (xr.pose ? 'yes' : 'no') + ', floor hits ' + xr.hitFrames +
+        ', space ' + xr.space + ', features ' + (xr.feats ? xr.feats.join(' ') : 'unknown')
+      : 'Preview mode: no camera, a pretend room.';
+  }
   pops.update(dt);
   reticle.visible = aim.ok && S.aiming;
   updateAimUI(false);
@@ -739,29 +774,52 @@ async function startXR() {
   try {
     const s = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['hit-test', 'dom-overlay'],
-      optionalFeatures: ['anchors'],
+      optionalFeatures: ['anchors', 'local-floor'],
       domOverlay: { root: $('#overlay') }
     });
     session = s;
     mode = 'xr';
     scene.background = null;
-    renderer.xr.setReferenceSpaceType('local');
+    const feats = s.enabledFeatures ? Array.from(s.enabledFeatures) : null;
+    Object.assign(xr, { frames: 0, pose: false, hitFrames: 0, feats, floorY: null });
+    xr.floorSpace = !!(feats && feats.indexOf('local-floor') >= 0);
+    xr.space = xr.floorSpace ? 'local-floor' : 'local';
+    renderer.xr.setReferenceSpaceType(xr.space);
     await renderer.xr.setSession(s);
     const viewer = await s.requestReferenceSpace('viewer');
     hitSource = await s.requestHitTestSource({ space: viewer });
     s.addEventListener('end', endGame);
-    const feats = s.enabledFeatures ? Array.from(s.enabledFeatures) : null;
-    log.add('ar_session', { mode: 'webxr', features: feats, dom_overlay: s.domOverlayState ? s.domOverlayState.type : null });
+    log.add('ar_session', { mode: 'webxr', features: feats, space: xr.space, dom_overlay: s.domOverlayState ? s.domOverlayState.type : null });
     beginGame();
+    const camPos = new THREE.Vector3(), camDir = new THREE.Vector3(), camQ = new THREE.Quaternion();
     renderer.setAnimationLoop((t, frame) => {
       if (frame) {
         const ref = renderer.xr.getReferenceSpace();
+        const vp = frame.getViewerPose(ref);
+        xr.frames++;
+        xr.pose = !!vp;
         const hits = hitSource ? frame.getHitTestResults(hitSource) : [];
+        aim.virtual = false;
         if (hits.length) {
+          xr.hitFrames++;
           const hp = hits[0].getPose(ref);
           aim.ok = !!hp; aim.hit = hits[0];
           if (hp) aim.matrix.fromArray(hp.transform.matrix);
         } else { aim.ok = false; aim.hit = null; }
+        if (vp) {
+          const p = vp.transform.position, o = vp.transform.orientation;
+          camPos.set(p.x, p.y, p.z);
+          xr.camY = p.y;
+          // no real hit: use the guessed floor plane, if the fallback is on
+          if (!aim.ok && xr.floorY != null) {
+            camDir.set(0, 0, -1).applyQuaternion(camQ.set(o.x, o.y, o.z, o.w));
+            const d = camDir.y < -0.05 ? (xr.floorY - camPos.y) / camDir.y : -1;
+            if (d > 0 && d < 6) {
+              aim.matrix.makeTranslation(camPos.x + camDir.x * d, xr.floorY, camPos.z + camDir.z * d);
+              aim.ok = true; aim.virtual = true;
+            }
+          }
+        }
         reticle.matrix.copy(aim.matrix);
         if (anchor && frame.trackedAnchors && frame.trackedAnchors.has(anchor)) {
           const ap = frame.getPose(anchor.anchorSpace, ref);
