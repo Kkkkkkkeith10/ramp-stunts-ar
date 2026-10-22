@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Depth Photo Test</title>
+<meta name="description" content="Test Depth Anything V2 Small on one photo, on this device, and turn it into a 3D stage.">
+<style>
+/* Layout: one phone column. Pick a photo, then the depth map and a tiltable 3D version below. */
+:root {
+  --bg: #F1F4F2; --surface: #FFFFFF; --ink: #14222C; --muted: #566873; --line: #D3DCD8;
+  --accent: #EE8A1F; --accent-ink: #2A1600; --good: #2A8A55; --oops: #C0402C;
+  --body: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #0E1920; --surface: #16252E; --ink: #E9F0EE; --muted: #96AAB5; --line: #2A3C47; --accent: #F59B3E; --good: #4DBD80; --oops: #EE7A66; color-scheme: dark; }
+}
+:root[data-theme="dark"] { --bg: #0E1920; --surface: #16252E; --ink: #E9F0EE; --muted: #96AAB5; --line: #2A3C47; --accent: #F59B3E; --good: #4DBD80; --oops: #EE7A66; color-scheme: dark; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 400 16px/1.45 var(--body); }
+.wrap { max-width: 640px; margin: 0 auto; padding: 16px max(16px, env(safe-area-inset-right)) 32px max(16px, env(safe-area-inset-left)); display: grid; gap: 12px; }
+h1 { font-size: 24px; margin: 0; }
+h2 { font-size: 18px; margin: 0 0 6px; }
+p { margin: 0 0 6px; }
+.muted { color: var(--muted); }
+.small { font-size: 14px; }
+.card { background: var(--surface); border: 2px solid var(--line); border-radius: 16px; padding: 14px; display: grid; gap: 10px; min-width: 0; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.btn { font: 700 16px/1.1 var(--body); min-height: 48px; padding: 10px 14px; border-radius: 12px; border: 0; background: var(--accent); color: var(--accent-ink); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; text-align: center; }
+.btn.alt { background: var(--surface); color: var(--ink); border: 2px solid var(--line); }
+.btn[disabled] { opacity: .45; cursor: default; }
+#status { font-weight: 700; margin: 0; }
+#status.err { color: var(--oops); }
+#status.ok { color: var(--good); }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.pair figure { margin: 0; display: grid; gap: 4px; min-width: 0; }
+.pair img, .pair canvas { width: 100%; height: auto; border-radius: 10px; background: #000; display: block; }
+figcaption { font-size: 13px; color: var(--muted); }
+#stage { width: 100%; aspect-ratio: 4 / 3; border-radius: 12px; background: #0E1920; touch-action: none; display: block; }
+label.slider { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: center; font-size: 14px; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Depth photo test</h1>
+    <p class="muted small">One photo, depth guessed by Depth Anything V2 Small, all on this device. The photo is not uploaded. The model (27 MB, or 50 MB on phones with WebGPU) downloads once from Hugging Face.</p>
+  </header>
+
+  <section class="card">
+    <h2>1. Pick a photo</h2>
+    <div class="row">
+      <label class="btn" for="cam">Take a photo</label>
+      <label class="btn alt" for="lib">Choose a photo</label>
+    </div>
+    <input id="cam" type="file" accept="image/*" capture="environment" hidden>
+    <input id="lib" type="file" accept="image/*" hidden>
+    <button class="btn alt" id="sample">Use a sample photo</button>
+    <p class="muted small">Tip: put the phone on a stand, side on to your ramp, about 1 m away. Take the photo with good light.</p>
+    <p id="status" aria-live="polite">Loading...</p>
+    <p class="muted small" id="tech"></p>
+  </section>
+
+  <section class="card" id="result" hidden>
+    <h2>2. What the model sees</h2>
+    <div class="pair">
+      <figure><img id="photo" alt="Your photo"><figcaption>Your photo</figcaption></figure>
+      <figure><canvas id="depth"></canvas><figcaption>Depth: bright is near, dark is far</figcaption></figure>
+    </div>
+    <h2>3. The photo as a 3D stage</h2>
+    <canvas id="stage"></canvas>
+    <p class="muted small">Drag to tilt. The edges stretch when you tilt far: the model only sees the front of things.</p>
+    <label class="slider">Depth <input id="strength" type="range" min="0" max="100" value="45"></label>
+    <label class="slider">Show <select id="view"><option value="photo">Photo</option><option value="depth">Depth colours</option><option value="wire">Wireframe</option></select></label>
+  </section>
+</div>
+
+<script type="module">
+import * as THREE from '../vendor/three.module.min.js';
+import { pipeline, env, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+
+const $ = (s) => document.querySelector(s);
+const MODEL = 'onnx-community/depth-anything-v2-small';
+const SAMPLE = 'https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/cats.jpg';
+env.allowLocalModels = false;
+
+function status(text, cls) { const s = $('#status'); s.textContent = text; s.className = cls || ''; }
+
+// ---------- the model: WebGPU if the phone has it, otherwise WebAssembly (slower) ----------
+let estimator = null, backend = '';
+async function loadModel() {
+  const hasGPU = !!(navigator.gpu && await navigator.gpu.requestAdapter().catch(() => null));
+  backend = hasGPU ? 'webgpu' : 'wasm';
+  status('Downloading the depth model (' + backend + ')... the first time can take a minute.');
+  const t0 = performance.now();
+  let lastPct = -1;
+  estimator = await pipeline('depth-estimation', MODEL, {
+    device: backend,
+    dtype: hasGPU ? 'fp16' : 'q8',
+    progress_callback: (p) => {
+      if (p.status === 'progress' && p.total) {
+        const pct = Math.round(p.loaded / p.total * 100);
+        if (pct !== lastPct) { lastPct = pct; status('Downloading the depth model: ' + pct + '% of ' + (p.total / 1e6).toFixed(0) + ' MB'); }
+      }
+    }
+  });
+  $('#tech').textContent = 'Model ready in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s using ' + backend + '.';
+  status('Ready. Pick a photo.', 'ok');
+}
+
+// ---------- run on one photo ----------
+async function run(url) {
+  if (!estimator) { status('The model is still loading. Try again in a moment.'); return; }
+  status('Looking at the photo...');
+  $('#photo').src = url;
+  const image = await RawImage.read(url);
+  const t0 = performance.now();
+  const out = await estimator(image);
+  const ms = performance.now() - t0;
+  const d = out.depth; // grayscale, same size as the photo: bright = near
+  drawDepth(d);
+  buildStage(url, d);
+  $('#result').hidden = false;
+  $('#tech').textContent = 'Depth in ' + (ms / 1000).toFixed(2) + ' s on ' + backend + ', photo ' + image.width + ' x ' + image.height + '.';
+  status('Done. Scroll down and drag the 3D stage.', 'ok');
+}
+
+function drawDepth(d) {
+  const c = $('#depth');
+  c.width = d.width; c.height = d.height;
+  const ctx = c.getContext('2d'), img = ctx.createImageData(d.width, d.height);
+  for (let i = 0; i < d.width * d.height; i++) {
+    const v = d.data[i * d.channels];
+    img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = v;
+    img.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+// ---------- the 3D stage: a grid pushed toward the camera by the depth map ----------
+const canvas = $('#stage');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0E1920);
+const camera = new THREE.PerspectiveCamera(40, 4 / 3, 0.01, 50);
+let mesh = null, depthData = null;
+const view = { yaw: 0, pitch: 0, dragging: null };
+
+function depthColor(v) {
+  // near = warm orange, far = deep blue, so depth reads at a glance
+  const t = v / 255;
+  return [0.05 + 0.88 * t, 0.15 + 0.4 * t * (1 - t) * 2.2, 0.45 * (1 - t) + 0.1];
+}
+
+function buildStage(url, d) {
+  depthData = d;
+  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); mesh.material.dispose(); }
+  const aspect = d.width / d.height, segX = 160, segY = Math.max(2, Math.round(160 / aspect));
+  const geo = new THREE.PlaneGeometry(aspect, 1, segX, segY);
+  const colors = new Float32Array(geo.attributes.position.count * 3);
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  const tex = new THREE.TextureLoader().load(url);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide }));
+  scene.add(mesh);
+  applyDepth();
+  applyView();
+}
+
+function applyDepth() {
+  if (!mesh) return;
+  const d = depthData, pos = mesh.geometry.attributes.position, uv = mesh.geometry.attributes.uv, col = mesh.geometry.attributes.color;
+  const k = Number($('#strength').value) / 100 * 0.8;
+  for (let i = 0; i < pos.count; i++) {
+    const x = Math.min(d.width - 1, Math.round(uv.getX(i) * (d.width - 1)));
+    const y = Math.min(d.height - 1, Math.round((1 - uv.getY(i)) * (d.height - 1)));
+    const v = d.data[(y * d.width + x) * d.channels];
+    pos.setZ(i, (v / 255) * k);
+    const c = depthColor(v);
+    col.setXYZ(i, c[0], c[1], c[2]);
+  }
+  pos.needsUpdate = true; col.needsUpdate = true;
+}
+
+function applyView() {
+  if (!mesh) return;
+  const m = mesh.material, mode = $('#view').value;
+  m.wireframe = mode === 'wire';
+  m.vertexColors = mode !== 'photo';
+  m.map = mode === 'photo' ? m.map || null : null;
+  if (mode === 'photo' && !m.map) m.map = new THREE.TextureLoader().load($('#photo').src);
+  m.color.set(0xffffff);
+  m.needsUpdate = true;
+}
+
+function resize() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== Math.round(w * renderer.getPixelRatio())) { renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); }
+}
+function frame() {
+  resize();
+  const r = 1.9;
+  camera.position.set(Math.sin(view.yaw) * r * Math.cos(view.pitch), Math.sin(view.pitch) * r, Math.cos(view.yaw) * r * Math.cos(view.pitch));
+  camera.lookAt(0, 0, 0.15);
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+canvas.addEventListener('pointerdown', (e) => { view.dragging = { x: e.clientX, y: e.clientY }; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointermove', (e) => {
+  if (!view.dragging) return;
+  view.yaw = Math.max(-0.9, Math.min(0.9, view.yaw - (e.clientX - view.dragging.x) * 0.006));
+  view.pitch = Math.max(-0.7, Math.min(0.7, view.pitch + (e.clientY - view.dragging.y) * 0.006));
+  view.dragging = { x: e.clientX, y: e.clientY };
+});
+['pointerup', 'pointercancel'].forEach((n) => canvas.addEventListener(n, () => { view.dragging = null; }));
+$('#strength').addEventListener('input', applyDepth);
+$('#view').addEventListener('change', applyView);
+requestAnimationFrame(frame);
+
+// ---------- inputs ----------
+['#cam', '#lib'].forEach((id) => $(id).addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (f) run(URL.createObjectURL(f)).catch(fail);
+}));
+// fetch the sample once into a local blob, so the photo, the model and the 3D texture share one copy
+$('#sample').addEventListener('click', async () => {
+  try {
+    status('Fetching the sample photo...');
+    const blob = await (await fetch(SAMPLE)).blob();
+    await run(URL.createObjectURL(blob));
+  } catch (e) { fail(e); }
+});
+function fail(err) { status('Something went wrong: ' + (err && err.message ? err.message : err), 'err'); console.error(err); }
+
+loadModel().catch(fail);
+
+// for testing
+window.__depth = { run, get ready() { return !!estimator; }, get backend() { return backend; } };
+</script>
+</body>
+</html>
