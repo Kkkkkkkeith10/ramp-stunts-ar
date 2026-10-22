@@ -48,7 +48,7 @@ const pops = makePops(root);
 let mode = null, session = null, hitSource = null, anchor = null, pretend = null;
 const aim = { ok: false, matrix: new THREE.Matrix4(), hit: null, virtual: false };
 // What the AR session is doing, for the diagnostics line and the guessed-floor fallback.
-const xr = { frames: 0, pose: false, hitFrames: 0, space: 'local', feats: null, floorSpace: false, floorY: null, camY: 0 };
+const xr = { frames: 0, pose: false, hitFrames: 0, space: 'local', feats: null, floorSpace: false, floorY: null, camY: 0, errors: 0, lastError: '' };
 const objs = { ramp: null, flags: {}, ghost: null, car: null, blocks: [], marks: [] };
 let pipA = createPip(R.vec(0, 0, 0));
 let hopRun = null, carRuns = [];
@@ -694,7 +694,8 @@ function tick() {
     if (g) g.hidden = !(t > 12 && !aim.ok && xr.floorY == null);
     if (dg) dg.textContent = mode === 'xr'
       ? 'Tech info: frames ' + xr.frames + ', phone tracked ' + (xr.pose ? 'yes' : 'no') + ', floor hits ' + xr.hitFrames +
-        ', space ' + xr.space + ', features ' + (xr.feats ? xr.feats.join(' ') : 'unknown')
+        ', space ' + xr.space + ', features ' + (xr.feats ? xr.feats.join(' ') : 'unknown') +
+        (xr.errors ? ', errors ' + xr.errors + ': ' + xr.lastError : '')
       : 'Preview mode: no camera, a pretend room.';
   }
   pops.update(dt);
@@ -769,6 +770,57 @@ function endGame() {
   $('#startLog').innerHTML = S.runs.length ? logBlock() : '';
 }
 
+// One AR frame: read the hit test, the guessed floor and the anchor, then update and draw.
+// three.js asks for the next AR frame only after this returns, so an uncaught error here
+// would stop AR for good (the camera keeps showing, everything else freezes). Errors are
+// caught, counted and shown in the tech info line instead.
+const camPos = new THREE.Vector3(), camDir = new THREE.Vector3(), camQ = new THREE.Quaternion();
+function xrStep(t, frame) {
+  if (!frame) return;
+  try {
+    const ref = renderer.xr.getReferenceSpace();
+    const vp = frame.getViewerPose(ref);
+    xr.frames++;
+    xr.pose = !!vp;
+    const hits = hitSource ? frame.getHitTestResults(hitSource) : [];
+    aim.virtual = false;
+    if (hits.length) {
+      xr.hitFrames++;
+      const hp = hits[0].getPose(ref);
+      aim.ok = !!hp; aim.hit = hits[0];
+      if (hp) aim.matrix.fromArray(hp.transform.matrix);
+    } else { aim.ok = false; aim.hit = null; }
+    if (vp) {
+      const p = vp.transform.position, o = vp.transform.orientation;
+      camPos.set(p.x, p.y, p.z);
+      xr.camY = p.y;
+      // no real hit: use the guessed floor plane, if the fallback is on
+      if (!aim.ok && xr.floorY != null) {
+        camDir.set(0, 0, -1).applyQuaternion(camQ.set(o.x, o.y, o.z, o.w));
+        const d = camDir.y < -0.05 ? (xr.floorY - camPos.y) / camDir.y : -1;
+        if (d > 0 && d < 6) {
+          aim.matrix.makeTranslation(camPos.x + camDir.x * d, xr.floorY, camPos.z + camDir.z * d);
+          aim.ok = true; aim.virtual = true;
+        }
+      }
+    }
+    reticle.matrix.copy(aim.matrix);
+    if (anchor && frame.trackedAnchors && frame.trackedAnchors.has(anchor)) {
+      const ap = frame.getPose(anchor.anchorSpace, ref);
+      if (ap) root.matrix.fromArray(ap.transform.matrix);
+    }
+    tick();
+    renderer.render(scene, camera);
+  } catch (err) {
+    xr.errors++;
+    if (!xr.lastError) {
+      xr.lastError = String(err && err.message ? err.message : err).slice(0, 160);
+      log.add('ar_session', { mode: 'webxr', error: xr.lastError, screen: S.screen });
+    }
+    try { updateAimUI(false); } catch (e) { /* keep going */ }
+  }
+}
+
 async function startXR() {
   const status = $('#xrStatus');
   try {
@@ -781,54 +833,20 @@ async function startXR() {
     mode = 'xr';
     scene.background = null;
     const feats = s.enabledFeatures ? Array.from(s.enabledFeatures) : null;
-    Object.assign(xr, { frames: 0, pose: false, hitFrames: 0, feats, floorY: null });
+    Object.assign(xr, { frames: 0, pose: false, hitFrames: 0, feats, floorY: null, errors: 0, lastError: '' });
     xr.floorSpace = !!(feats && feats.indexOf('local-floor') >= 0);
     xr.space = xr.floorSpace ? 'local-floor' : 'local';
     renderer.xr.setReferenceSpaceType(xr.space);
+    // Set the loop before the session starts, so three.js runs only the AR frame loop.
+    // Setting it afterwards also restarts the normal browser loop, which draws outside AR frames.
+    renderer.setAnimationLoop(xrStep);
     await renderer.xr.setSession(s);
     const viewer = await s.requestReferenceSpace('viewer');
     hitSource = await s.requestHitTestSource({ space: viewer });
     s.addEventListener('end', endGame);
     log.add('ar_session', { mode: 'webxr', features: feats, space: xr.space, dom_overlay: s.domOverlayState ? s.domOverlayState.type : null });
+    status.textContent = '';
     beginGame();
-    const camPos = new THREE.Vector3(), camDir = new THREE.Vector3(), camQ = new THREE.Quaternion();
-    renderer.setAnimationLoop((t, frame) => {
-      if (frame) {
-        const ref = renderer.xr.getReferenceSpace();
-        const vp = frame.getViewerPose(ref);
-        xr.frames++;
-        xr.pose = !!vp;
-        const hits = hitSource ? frame.getHitTestResults(hitSource) : [];
-        aim.virtual = false;
-        if (hits.length) {
-          xr.hitFrames++;
-          const hp = hits[0].getPose(ref);
-          aim.ok = !!hp; aim.hit = hits[0];
-          if (hp) aim.matrix.fromArray(hp.transform.matrix);
-        } else { aim.ok = false; aim.hit = null; }
-        if (vp) {
-          const p = vp.transform.position, o = vp.transform.orientation;
-          camPos.set(p.x, p.y, p.z);
-          xr.camY = p.y;
-          // no real hit: use the guessed floor plane, if the fallback is on
-          if (!aim.ok && xr.floorY != null) {
-            camDir.set(0, 0, -1).applyQuaternion(camQ.set(o.x, o.y, o.z, o.w));
-            const d = camDir.y < -0.05 ? (xr.floorY - camPos.y) / camDir.y : -1;
-            if (d > 0 && d < 6) {
-              aim.matrix.makeTranslation(camPos.x + camDir.x * d, xr.floorY, camPos.z + camDir.z * d);
-              aim.ok = true; aim.virtual = true;
-            }
-          }
-        }
-        reticle.matrix.copy(aim.matrix);
-        if (anchor && frame.trackedAnchors && frame.trackedAnchors.has(anchor)) {
-          const ap = frame.getPose(anchor.anchorSpace, ref);
-          if (ap) root.matrix.fromArray(ap.transform.matrix);
-        }
-      }
-      tick();
-      renderer.render(scene, camera);
-    });
   } catch (err) {
     status.textContent = 'Could not start AR: ' + (err && err.message ? err.message : err);
     status.className = 'warn';
