@@ -10,9 +10,11 @@
 
 export const DEFAULTS = { hfovDeg: 66, near: 0.5, far: 4 };
 
-// A pinhole camera for a photo of w x h pixels. Phone main cameras are roughly 65-75 degrees wide.
+// A pinhole camera for a photo of w x h pixels. Phone main cameras see roughly 65-75 degrees
+// across the long side of the picture, so the angle applies to the long side: a portrait photo
+// is narrower across its width.
 export function makeCamera(w, h, hfovDeg = DEFAULTS.hfovDeg) {
-  const fx = (w / 2) / Math.tan(hfovDeg * Math.PI / 360);
+  const fx = (Math.max(w, h) / 2) / Math.tan(hfovDeg * Math.PI / 360);
   return { w, h, fx, fy: fx, cx: w / 2, cy: h / 2 };
 }
 

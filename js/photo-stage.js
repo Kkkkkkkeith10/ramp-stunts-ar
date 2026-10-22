@@ -31,35 +31,47 @@ function say(text) {
 function showTech() {
   const f = tech.floor, t = tech.tilt, c = tech.cal;
   $('#tech').textContent = 'Depth model ' + tech.backend + ', loaded in ' + tech.loadS.toFixed(1) + ' s, depth in ' + tech.depthS.toFixed(2) + ' s. ' +
-    (t ? 'Camera tilt from ' + t.source + ': ' + t.deg.toFixed(0) + ' degrees down. ' : 'No camera tilt: depth is a guess, slopes may read flat. ') +
+    (t ? 'Camera tilt from ' + t.source + ': ' + t.deg.toFixed(0) + ' degrees down, roll ' + (t.roll || 0).toFixed(0) + '. ' : 'No camera tilt: depth is a guess, slopes may read flat. ') +
     (c ? (c.ok ? 'Depth calibrated (floor matches gravity within ' + c.mismatchDeg.toFixed(1) + ' degrees). ' : 'Calibration failed (' + c.reason + '), using the guess. ') : '') +
     (f ? 'Floor fit ' + Math.round(f.share * 100) + '% of the lower photo' + (f.ok ? '' : ' (weak, so "up" may be off)') + '.' : '');
 }
 
 // ---------- the phone's tilt at photo time ----------
 
-// Keep the latest DeviceOrientation reading. "Take a photo" opens the camera app, so the page
-// reads the tilt just before it opens and again just after it returns (the phone should be on
-// its stand and still). iPhone asks permission first, on a tap.
-const tiltNow = { beta: null, gamma: null, at: 0 };
+// Keep the last second of DeviceOrientation readings. The in-page camera takes the photo and
+// the tilt at the same moment (averaged over the last half second, so a small shake does not
+// spoil it). The camera-app fallback can only read just before and just after.
+// iPhone asks permission first, on a tap.
+const tiltLog = [];
 window.addEventListener('deviceorientation', (e) => {
   if (e.beta == null || e.gamma == null) return;
-  tiltNow.beta = e.beta; tiltNow.gamma = e.gamma; tiltNow.at = performance.now();
+  const now = performance.now();
+  tiltLog.push({ beta: e.beta, gamma: e.gamma, at: now });
+  while (tiltLog.length && now - tiltLog[0].at > 1000) tiltLog.shift();
 });
 let tiltBefore = null;
 function readTilt() {
-  return tiltNow.beta == null ? null : { beta: tiltNow.beta, gamma: tiltNow.gamma, at: tiltNow.at };
+  const r = tiltLog[tiltLog.length - 1];
+  return r ? { ...r } : null;
+}
+// Average of the last `ms` of readings, and how much they wandered (degrees).
+function averageTilt(ms = 500) {
+  const now = performance.now(), recent = tiltLog.filter((r) => now - r.at <= ms);
+  if (!recent.length) return null;
+  const avg = (k) => recent.reduce((s, r) => s + r[k], 0) / recent.length;
+  const spread = (k) => Math.max(...recent.map((r) => r[k])) - Math.min(...recent.map((r) => r[k]));
+  return { beta: avg('beta'), gamma: avg('gamma'), at: now, count: recent.length, wander: Math.max(spread('beta'), spread('gamma')) };
 }
 async function askTiltPermission() {
   const D = window.DeviceOrientationEvent;
   if (D && typeof D.requestPermission === 'function') { try { await D.requestPermission(); } catch (e) { /* refused */ } }
 }
-// "Up" in the camera frame and how far the camera points down, from a reading.
+// "Up" in the camera frame, how far the camera points down, and its roll, from a reading.
 function tiltFromReading(r, source) {
   const up = upInPhoto(upFromOrientation(r.beta, r.gamma));
-  return { up, deg: Math.asin(Math.max(-1, Math.min(1, up.z))) * 180 / Math.PI, source };
+  return { up, deg: Math.asin(Math.max(-1, Math.min(1, up.z))) * 180 / Math.PI, roll: Math.atan2(up.x, up.y) * 180 / Math.PI, source };
 }
-function tiltFromDeg(deg, source) { return { up: upFromPitch(deg), deg, source }; }
+function tiltFromDeg(deg, source) { return { up: upFromPitch(deg), deg, roll: 0, source }; }
 
 // ---------- the depth model ----------
 
@@ -134,7 +146,8 @@ const camera = new THREE.PerspectiveCamera(50, 4 / 3, 0.02, 30);
 
 let surface = null, frame = null, mesh = null, floorGroup = null, pipModel = null;
 let pipA = null, pipPx = null, hopRun = null, carRun = null, ramp = null, mode = 'walk';
-const view = { yaw: 0, pitch: 0, pivot: new THREE.Vector3(0, 0, -1.5) };
+const view = { yaw: 0, pitch: 0, zoom: 1, pivot: new THREE.Vector3(0, 0, -1.5) };
+let meshView = false, helpers = null;
 const labels = [];
 
 // The stage's size factor: 1 = the guess (floor about 1 m away); set from the child's books.
@@ -165,8 +178,96 @@ function effectiveTilt() {
   return photo.sensorTilt;
 }
 
-// keep: { pipPx, ramp: { bottomPx, topPx, hops } } to rebuild without the drop-in (after resizing).
 function buildStage(keep = null) {
+  buildStageInner(keep);
+  applyMeshView();
+}
+
+// ---------- "Show 3D mesh": check what the depth model and the maths made of the photo ----------
+
+// Wireframe in depth colours, plus: the fitted floor as a grid, gravity's "up" as an arrow,
+// the measured ramp (foot on the floor to the top) as a line, and the camera where the photo
+// was taken. Free orbit and zoom.
+function applyMeshView() {
+  if (!mesh) return;
+  if (helpers) { helpers.forEach((h) => h.parent && h.parent.remove(h)); helpers = null; }
+  const m = mesh.material;
+  if (!meshView) { applyShowDepth(); return; }
+  m.map = null; m.vertexColors = true; m.needsUpdate = true;
+  helpers = [];
+  const v = (a) => new THREE.Vector3(a.x, a.y, a.z);
+
+  // a coarse wire grid over the solid depth colours, so the shape reads at a glance
+  const segX = 48, segY = Math.max(2, Math.round(segX * photo.h / photo.w)), pts = [];
+  const P = (i, j) => surface.point(i / segX * photo.w, j / segY * photo.h);
+  for (let j = 0; j <= segY; j++) for (let i = 0; i <= segX; i++) {
+    const p = P(i, j);
+    if (i < segX) { const q = P(i + 1, j); pts.push(p.x, p.y, p.z, q.x, q.y, q.z); }
+    if (j < segY) { const q = P(i, j + 1); pts.push(p.x, p.y, p.z, q.x, q.y, q.z); }
+  }
+  const wg = new THREE.BufferGeometry();
+  wg.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  const wire = new THREE.LineSegments(wg, new THREE.LineBasicMaterial({ color: 0x0E1920, transparent: true, opacity: 0.45 }));
+  scene.add(wire); helpers.push(wire);
+
+  // the floor: a grid on the fitted plane, under the middle of the photo
+  const f = tech.floor, p0 = { x: -f.d * f.n.x, y: -f.d * f.n.y, z: -f.d * f.n.z };
+  const floorY = local(p0).y, mid = local(view.pivot);
+  const grid = new THREE.GridHelper(2 * worldScale.k, 20, 0x0B7A85, 0x4c8c94);
+  grid.position.set(mid.x, floorY + 0.001, mid.z);
+  floorGroup.add(grid); helpers.push(grid);
+
+  // gravity's up, from the floor under the middle
+  const arrow = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(mid.x, floorY, mid.z), 0.3 * worldScale.k, 0xD9A400);
+  floorGroup.add(arrow); helpers.push(arrow);
+
+  // the measured ramp
+  if (ramp && ramp.footC && ramp.topC) {
+    const a = local(ramp.footC), b = local(ramp.topC);
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([v(a), v(b)]), new THREE.LineBasicMaterial({ color: 0xff3b30, depthTest: false }));
+    line.renderOrder = 20;
+    floorGroup.add(line); helpers.push(line);
+    [a, b].forEach((p) => {
+      const s = new THREE.Mesh(new THREE.SphereGeometry(0.012 * worldScale.k, 12, 8), new THREE.MeshBasicMaterial({ color: 0xff3b30, depthTest: false }));
+      s.position.copy(v(p)); s.renderOrder = 20;
+      floorGroup.add(s); helpers.push(s);
+    });
+    // the floor point straight under the top, to show rise and run
+    const under = { x: b.x, y: a.y, z: b.z };
+    const legs = new THREE.Line(new THREE.BufferGeometry().setFromPoints([v(a), v(under), v(b)]), new THREE.LineDashedMaterial({ color: 0xffffff, dashSize: 0.01, gapSize: 0.008, depthTest: false }));
+    legs.computeLineDistances(); legs.renderOrder = 20;
+    floorGroup.add(legs); helpers.push(legs);
+  }
+
+  // where the camera was (the photo's viewpoint)
+  const shot = new THREE.PerspectiveCamera(camera.fov, photo.w / photo.h, 0.02, 0.25 * worldScale.k);
+  shot.updateMatrixWorld(true);
+  const ch = new THREE.CameraHelper(shot);
+  scene.add(ch); helpers.push(ch);
+}
+
+$('#meshBtn').addEventListener('click', () => {
+  meshView = !meshView;
+  $('#meshBtn').setAttribute('aria-pressed', String(meshView));
+  $('#meshBtn').textContent = meshView ? 'Back to the photo' : 'Show 3D mesh';
+  $('#meshTip').textContent = meshView
+    ? 'Mesh view: drag to orbit, pinch or scroll to zoom. Grid = the floor Pip found. Yellow arrow = up from the tilt sensor. Red line = the ramp as measured, white dashes = its rise and run. The small frame shows where the camera was.'
+    : 'Drag to tilt the stage. Tap to move Pip. Nearer real things hide him.';
+  // start the mesh view from the side, centred on the ramp if Pip has measured one
+  if (meshView) {
+    view.homePivot = view.pivot.clone();
+    if (ramp && ramp.footC && ramp.topC) view.pivot.set((ramp.footC.x + ramp.topC.x) / 2, (ramp.footC.y + ramp.topC.y) / 2, (ramp.footC.z + ramp.topC.z) / 2);
+    view.yaw = 0.9; view.pitch = 0.35; view.zoom = ramp && ramp.footC ? 0.9 : 1.8;
+  } else {
+    if (view.homePivot) view.pivot.copy(view.homePivot);
+    view.yaw = 0; view.pitch = 0; view.zoom = 1;
+  }
+  setTag(meshView ? '3D mesh view' : 'Tap the floor to move Pip');
+  applyMeshView();
+});
+
+// keep: { pipPx, ramp: { bottomPx, topPx, hops } } to rebuild without the drop-in (after resizing).
+function buildStageInner(keep = null) {
   const { size, depthAmt } = settingsNow();
   const cam = makeCamera(photo.w, photo.h);
   const far = DEFAULTS.near + (DEFAULTS.far - DEFAULTS.near) * depthAmt;
@@ -353,7 +454,7 @@ function rampTap(px) {
 // Slope numbers: the bottom on the floor, the top from depth (Pip's hops follow the photo).
 function measureRamp() {
   const m = rampFromPhotoTaps(surface, tech.floor, frame.up, ramp.bottomPx, ramp.topPx);
-  if (m.ok) { ramp.rise = m.rise; ramp.run = m.run; }
+  if (m.ok) { ramp.rise = m.rise; ramp.run = m.run; ramp.footC = m.foot; ramp.topC = m.top; }
   else {
     const a = local(surface.point(...ramp.bottomPx)), b = local(surface.point(...ramp.topPx));
     ramp.rise = b.y - a.y; ramp.run = Math.hypot(b.x - a.x, b.z - a.z);
@@ -362,6 +463,7 @@ function measureRamp() {
   $('#tech').textContent += ' Ramp: ' + Math.round(ramp.run * 100) + ' cm across, ' + Math.round(ramp.rise * 100) + ' cm up, ' +
     Math.round(Math.atan2(ramp.rise, ramp.run) * 180 / Math.PI) + ' degrees' +
     (worldScale.fromBooks ? ' (sized from ' + plural(worldScale.books, 'book') + ').' : ' (sizes are a guess until you tell Pip the books).');
+  if (meshView) applyMeshView();
 }
 
 // The child's book count sets the real size: rebuild the stage scaled about the camera, so the
@@ -415,17 +517,40 @@ function carAt(c, s) {
 
 const ray = new THREE.Raycaster();
 let press = null;
-canvas.addEventListener('pointerdown', (e) => { press = { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, t: performance.now(), moved: 0 }; canvas.setPointerCapture(e.pointerId); });
+const fingers = new Map();
+canvas.addEventListener('pointerdown', (e) => {
+  fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  press = { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, t: performance.now(), moved: fingers.size > 1 ? 99 : 0 };
+  canvas.setPointerCapture(e.pointerId);
+});
 canvas.addEventListener('pointermove', (e) => {
   if (!press) return;
+  if (fingers.size === 2 && fingers.has(e.pointerId)) {
+    // pinch to zoom (mesh view)
+    const [a, b] = [...fingers.values()], before = Math.hypot(a.x - b.x, a.y - b.y);
+    fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const [c, d] = [...fingers.values()], after = Math.hypot(c.x - d.x, c.y - d.y);
+    if (meshView && before > 0 && after > 0) view.zoom = Math.max(0.3, Math.min(4, view.zoom * before / after));
+    press.moved = 99;
+    return;
+  }
+  fingers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   press.moved += Math.abs(e.clientX - press.lx) + Math.abs(e.clientY - press.ly);
   if (press.moved > 10) {
-    view.yaw = Math.max(-0.55, Math.min(0.55, view.yaw - (e.clientX - press.lx) * 0.005));
-    view.pitch = Math.max(-0.45, Math.min(0.45, view.pitch - (e.clientY - press.ly) * 0.005));
+    // a little tilt in the photo view; free orbit in the mesh view
+    const yawMax = meshView ? Math.PI : 0.55, pitchMin = meshView ? -0.3 : -0.45, pitchMax = meshView ? 1.45 : 0.45;
+    view.yaw = Math.max(-yawMax, Math.min(yawMax, view.yaw - (e.clientX - press.lx) * 0.005));
+    view.pitch = Math.max(pitchMin, Math.min(pitchMax, view.pitch - (e.clientY - press.ly) * 0.005));
   }
   press.lx = e.clientX; press.ly = e.clientY;
 });
+canvas.addEventListener('wheel', (e) => {
+  if (!meshView) return;
+  e.preventDefault();
+  view.zoom = Math.max(0.3, Math.min(4, view.zoom * (1 + e.deltaY * 0.001)));
+}, { passive: false });
 canvas.addEventListener('pointerup', (e) => {
+  fingers.delete(e.pointerId);
   const p = press; press = null;
   if (!p || p.moved > 10 || !mesh) return;
   const r = canvas.getBoundingClientRect();
@@ -434,7 +559,7 @@ canvas.addEventListener('pointerup', (e) => {
   if (!hit) return;
   tapPixel(surface.pixelOf(hit.point));
 });
-canvas.addEventListener('pointercancel', () => { press = null; });
+canvas.addEventListener('pointercancel', (e) => { fingers.delete(e.pointerId); press = null; });
 
 function tapPixel(px) {
   if (mode === 'walk') walkTo(px);
@@ -451,7 +576,7 @@ $('#rampBtn').addEventListener('click', () => {
   say('Show me your ramp! Tap the bottom first.');
 });
 $('#carBtn').addEventListener('click', ghostCar);
-$('#homeBtn').addEventListener('click', () => { view.yaw = 0; view.pitch = 0; });
+$('#homeBtn').addEventListener('click', () => { view.yaw = 0; view.pitch = 0; view.zoom = 1; });
 $('#newBtn').addEventListener('click', () => {
   $('#pick').hidden = false; $('#stagebox').hidden = true; $('#controls').hidden = true;
   say('New photo? Show me!');
@@ -472,8 +597,71 @@ $('#booksBtn').addEventListener('click', applyBooks);
 $('#tiltDeg').addEventListener('input', () => { $('#tiltVal').textContent = $('#tiltDeg').value + ' deg'; });
 $('#tiltDeg').addEventListener('change', () => { if (photo && $('#tiltMode').value === 'manual') buildStage(); });
 
-// Tilt before the camera app opens (also asks iPhone for permission, on this tap).
-$('label[for=cam]').addEventListener('click', () => { askTiltPermission(); tiltBefore = readTilt(); });
+// ---------- the in-page camera: photo and tilt at the same moment ----------
+
+let stream = null;
+$('#camBtn').addEventListener('click', async () => {
+  // no in-page camera here: fall back to the camera app (still inside this tap)
+  if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) { tiltBefore = readTilt(); $('#cam').click(); return; }
+  askTiltPermission(); // iPhone: must be asked on the tap
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1440 } }
+    });
+  } catch (err) {
+    status('The camera could not open here (' + (err && err.name ? err.name : 'blocked') + '). Use "Choose a photo", or allow the camera for this page.', 'err');
+    return;
+  }
+  const v = $('#video');
+  v.srcObject = stream;
+  await v.play().catch(() => {});
+  $('#pick').hidden = true;
+  $('#camView').hidden = false;
+  say('Point me at your ramp. Hold still, then tap Take it.');
+});
+
+function closeCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+  $('#video').srcObject = null;
+  $('#camView').hidden = true;
+}
+
+$('#camCancel').addEventListener('click', () => { closeCamera(); $('#pick').hidden = false; });
+
+$('#snapBtn').addEventListener('click', async () => {
+  const v = $('#video');
+  if (!v.videoWidth) return;
+  // the frame and the tilt, together
+  const reading = averageTilt(500);
+  const c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0);
+  closeCamera();
+  let tilt = null;
+  if (reading) {
+    tilt = tiltFromReading(reading, 'phone sensor at the moment of the photo');
+    if (reading.wander > 3) tilt.source += ' (the phone was moving ' + reading.wander.toFixed(0) + ' degrees)';
+  }
+  const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.92));
+  usePhoto(URL.createObjectURL(blob), tilt).catch(fail);
+});
+
+// live tilt readout and a horizon line while the camera is open
+function showLiveTilt() {
+  if ($('#camView').hidden) return;
+  const r = averageTilt(300), el = $('#tiltLive'), hz = $('#horizon');
+  if (!r) { el.textContent = 'No tilt reading yet (move the phone a little)'; hz.hidden = true; return; }
+  const t = tiltFromReading(r, '');
+  hz.hidden = false;
+  hz.style.transform = 'rotate(' + t.roll.toFixed(1) + 'deg)';
+  hz.classList.toggle('level', Math.abs(t.roll) < 2);
+  el.textContent = 'Camera points ' + t.deg.toFixed(0) + ' degrees down' + (Math.abs(t.roll) >= 2 ? ', tipped ' + Math.abs(t.roll).toFixed(0) + ' degrees' : ', level') +
+    (r.wander > 3 ? ' · hold still' : '');
+}
+
+// Fallback: the phone's camera app. Tilt is read just before it opens (tiltBefore, set when the
+// button falls back) and just after it returns.
 $('#cam').addEventListener('change', async (e) => {
   const f = e.target.files && e.target.files[0];
   e.target.value = '';
@@ -505,7 +693,7 @@ function step() {
   const now = nowSec();
   if (mesh) {
     // orbit the photo's middle; at yaw = pitch = 0 the camera is exactly where the photo was taken
-    const d = view.pivot.length();
+    const d = view.pivot.length() * view.zoom;
     const dir = new THREE.Vector3(Math.sin(view.yaw) * Math.cos(view.pitch), Math.sin(view.pitch), Math.cos(view.yaw) * Math.cos(view.pitch));
     camera.position.copy(view.pivot).addScaledVector(dir, d);
     camera.lookAt(view.pivot);
@@ -530,7 +718,7 @@ function step() {
     renderer.render(scene, camera);
   }
 }
-function loop() { step(); requestAnimationFrame(loop); }
+function loop() { step(); showLiveTilt(); requestAnimationFrame(loop); }
 requestAnimationFrame(loop);
 
 loadModel().catch(fail);

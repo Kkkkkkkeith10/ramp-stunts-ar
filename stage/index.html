@@ -47,6 +47,12 @@ details[open] { display: grid; gap: 8px; }
 .stepper b { font-size: 26px; min-width: 2ch; text-align: center; font-variant-numeric: tabular-nums; }
 .stepper .btn.alt { min-width: 48px; font-size: 22px; padding: 6px; }
 input[type=number] { font: inherit; padding: 6px 8px; border-radius: 10px; border: 2px solid var(--line); background: var(--bg); color: var(--ink); width: 100%; }
+.camwrap { position: relative; border-radius: 14px; overflow: hidden; background: #000; }
+#video { width: 100%; max-height: 62vh; display: block; object-fit: contain; }
+/* a line that stays level with the real horizon: it tilts as the phone rolls */
+.horizon { position: absolute; left: 10%; right: 10%; top: 50%; height: 0; border-top: 3px dashed rgba(255,255,255,.8); pointer-events: none; }
+.horizon.level { border-top-color: var(--repeat); border-top-style: solid; }
+#meshBtn[aria-pressed="true"] { border-color: var(--repeat); background: color-mix(in srgb, var(--repeat) 18%, var(--surface)); }
 #tech { font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; color: var(--muted); word-break: break-word; }
 a { color: inherit; }
 </style>
@@ -62,14 +68,28 @@ a { color: inherit; }
 
   <section class="card" id="pick">
     <div class="row">
-      <label class="btn" for="cam">Take a photo</label>
+      <button class="btn" id="camBtn">Take a photo</button>
       <label class="btn alt" for="lib">Choose a photo</label>
     </div>
     <input id="cam" type="file" accept="image/*" capture="environment" hidden>
     <input id="lib" type="file" accept="image/*" hidden>
     <button class="btn alt" id="sample">Use the sample ramp</button>
-    <p class="muted small">Best photo: phone on a stand, side on to the ramp, about 1 m away, floor in the bottom half, good light. Keep the phone still while the camera is open: Pip reads its tilt to get the slope right.</p>
+    <p class="muted small">Best photo: phone on a stand, side on to the ramp, about 1 m away, floor in the bottom half, good light. Pip reads the phone's tilt at the moment you take it.</p>
     <p id="status" aria-live="polite">Loading...</p>
+  </section>
+
+  <!-- the camera inside the page, so the photo and the phone's tilt are taken at the same moment -->
+  <section class="card" id="camView" hidden>
+    <div class="camwrap">
+      <video id="video" playsinline muted></video>
+      <div class="horizon" id="horizon" aria-hidden="true"></div>
+      <span class="tag" id="tiltLive">Reading the tilt...</span>
+    </div>
+    <div class="row">
+      <button class="btn" id="snapBtn">Take it</button>
+      <button class="btn alt" id="camCancel">Cancel</button>
+    </div>
+    <p class="muted small" id="camTip">Hold still, or stand the phone on something. Somewhere between 15 and 60 degrees down works best.</p>
   </section>
 
   <section class="stagebox" id="stagebox" hidden>
@@ -95,7 +115,8 @@ a { color: inherit; }
       <button class="btn alt" id="homeBtn">Back to the photo view</button>
       <button class="btn alt" id="newBtn">New photo</button>
     </div>
-    <p class="muted small">Drag to tilt the stage. Tap to move Pip. Nearer real things hide him.</p>
+    <button class="btn alt" id="meshBtn" aria-pressed="false">Show 3D mesh</button>
+    <p class="muted small" id="meshTip">Drag to tilt the stage. Tap to move Pip. Nearer real things hide him.</p>
     <details>
       <summary>Grown-up settings and tech info</summary>
       <label class="slider">One book (cm) <input id="bookCm" type="number" min="0.5" max="8" step="0.5" inputmode="decimal"></label>

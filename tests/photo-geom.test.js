@@ -184,3 +184,9 @@ test('scale from books: the ramp comes out the real size', async () => {
   near(r2.run, 0.40, 0.04);
   near(r2.angleDeg, r1.angleDeg, 0.3);
 });
+
+test('the field of view applies to the long side, in portrait too', () => {
+  const land = makeCamera(400, 300), port = makeCamera(300, 400);
+  near(land.fx, port.fx);
+  near(2 * Math.atan(200 / port.fx) * 180 / Math.PI, 66);
+});
