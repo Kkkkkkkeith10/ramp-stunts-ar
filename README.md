@@ -13,7 +13,11 @@ One photo, no tracking. Depth Anything V2 Small (Apache-2.0, via Transformers.js
 - Drag to tilt the stage a little. Far tilts stretch the picture: the model only sees the front of things.
 - Logic is in `js/photo-geom.js`, tested in `tests/photo-geom.test.js`. `stage/sample-ramp.jpg` is a render from the AR preview's pretend room, not a real photo.
 - Checked on the sample: depth in about 1.5 s with WebGPU on a laptop, the floor fit recovered the camera tilt (31 degrees found, about 33 real). Not yet checked on a phone or on real photos.
-- **Known weakness:** the model gives relative depth only, so distances use a guessed near/far range. Shapes and hop paths look right, but slopes come out too flat (the sample's 11 degree ramp read as 1 degree). Fix to try next: use the phone's tilt sensor at photo time, or the book count, to calibrate the depth.
+- **Slopes.** The model gives relative depth (unknown scale and shift). Two fixes:
+  1. *Tilt calibration:* the phone's tilt (DeviceOrientation) is read just before and after the camera app opens. Gravity tells us how the floor should face, which solves the depth shift (`calibrateShift`). Library photos have no tilt; "Grown-up settings" lets you set it by hand.
+  2. *The bottom touches the floor:* the slope uses the floor plane under the bottom tap, and depth only for the top (`rampFromPhotoTaps`). On the sample render, the model read the plain grey tray as a flat board 10 cm above the floor, so this rule mattered most.
+- Results on the sample (true slope 10.6 degrees): 9.0 with the right tilt, 9.3 with no tilt, 8.2 to 9.7 with the tilt 8 degrees off; it read 1 degree before these fixes. In a synthetic test with the camera looking 50 degrees down, calibration corrected 16.3 to 10.7.
+- **Still a guess:** sizes in cm (the floor is assumed to be about 1 m away; the sample's 40 cm ramp reads 71 cm). The child's book count could fix the scale next. Not yet checked: real photos, real phones, and whether every phone's sensor and camera app agree on "up".
 
 `depth/` is the plain depth test: photo, depth map and a tiltable 3D version.
 

@@ -63,7 +63,7 @@ a { color: inherit; }
     <input id="cam" type="file" accept="image/*" capture="environment" hidden>
     <input id="lib" type="file" accept="image/*" hidden>
     <button class="btn alt" id="sample">Use the sample ramp</button>
-    <p class="muted small">Best photo: phone on a stand, side on to the ramp, about 1 m away, floor in the bottom half, good light.</p>
+    <p class="muted small">Best photo: phone on a stand, side on to the ramp, about 1 m away, floor in the bottom half, good light. Keep the phone still while the camera is open: Pip reads its tilt to get the slope right.</p>
     <p id="status" aria-live="polite">Loading...</p>
   </section>
 
@@ -85,7 +85,9 @@ a { color: inherit; }
     <details>
       <summary>Grown-up settings and tech info</summary>
       <label class="slider">Pip size <input id="size" type="range" min="40" max="250" value="100"></label>
-      <label class="slider">Depth <input id="depthAmt" type="range" min="20" max="200" value="100"></label>
+      <label class="slider">Camera tilt <select id="tiltMode"><option value="auto">From the phone sensor</option><option value="manual">Set by hand</option><option value="off">Off (old guess)</option></select></label>
+      <label class="slider">Tilt down <span><input id="tiltDeg" type="range" min="0" max="85" value="30"> <span id="tiltVal">30 deg</span></span></label>
+      <label class="slider">Depth (no tilt) <input id="depthAmt" type="range" min="20" max="200" value="100"></label>
       <label class="slider">Show depth <input id="showDepth" type="checkbox"></label>
       <p id="tech"></p>
     </details>

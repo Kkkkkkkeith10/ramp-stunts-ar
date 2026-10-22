@@ -6,7 +6,10 @@
 // floor frame (y along the fitted floor normal) so his hops stay upright.
 import { THREE, makePip, applyPipPose, makeCar, placeCar, makeLabel } from './scene.js';
 import { createPip, play, pose, settle } from './pip-anim.js';
-import { makeCamera, createSurface, fitFloor, floorFrame, surfacePath, DEFAULTS } from './photo-geom.js';
+import {
+  makeCamera, createSurface, fitFloor, floorFrame, surfacePath, DEFAULTS,
+  upFromOrientation, upInPhoto, upFromPitch, fitDispPlane, calibrateShift, rampFromPhotoTaps
+} from './photo-geom.js';
 import { pipeline, env, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
 
 const $ = (s) => document.querySelector(s);
@@ -16,7 +19,7 @@ const MAX_SIDE = 640;
 const HOP = 0.06; // metres per hop at Pip's normal size (sizes are a guess, see photo-geom.js)
 env.allowLocalModels = false;
 
-const tech = { backend: '', loadS: 0, depthS: 0, floor: null };
+const tech = { backend: '', loadS: 0, depthS: 0, floor: null, tilt: null, cal: null };
 function status(text, cls) { const s = $('#status'); s.textContent = text; s.className = cls || ''; }
 function say(text) {
   $('#bubble').textContent = text;
@@ -25,11 +28,37 @@ function say(text) {
   }
 }
 function showTech() {
-  const f = tech.floor;
+  const f = tech.floor, t = tech.tilt, c = tech.cal;
   $('#tech').textContent = 'Depth model ' + tech.backend + ', loaded in ' + tech.loadS.toFixed(1) + ' s, depth in ' + tech.depthS.toFixed(2) + ' s. ' +
-    (f ? 'Floor fit ' + Math.round(f.share * 100) + '% of the lower photo' + (f.ok ? '' : ' (weak, so "up" may be off)') +
-      ', normal ' + [f.n.x, f.n.y, f.n.z].map((v) => v.toFixed(2)).join(' ') + '.' : '');
+    (t ? 'Camera tilt from ' + t.source + ': ' + t.deg.toFixed(0) + ' degrees down. ' : 'No camera tilt: depth is a guess, slopes may read flat. ') +
+    (c ? (c.ok ? 'Depth calibrated (floor matches gravity within ' + c.mismatchDeg.toFixed(1) + ' degrees). ' : 'Calibration failed (' + c.reason + '), using the guess. ') : '') +
+    (f ? 'Floor fit ' + Math.round(f.share * 100) + '% of the lower photo' + (f.ok ? '' : ' (weak, so "up" may be off)') + '.' : '');
 }
+
+// ---------- the phone's tilt at photo time ----------
+
+// Keep the latest DeviceOrientation reading. "Take a photo" opens the camera app, so the page
+// reads the tilt just before it opens and again just after it returns (the phone should be on
+// its stand and still). iPhone asks permission first, on a tap.
+const tiltNow = { beta: null, gamma: null, at: 0 };
+window.addEventListener('deviceorientation', (e) => {
+  if (e.beta == null || e.gamma == null) return;
+  tiltNow.beta = e.beta; tiltNow.gamma = e.gamma; tiltNow.at = performance.now();
+});
+let tiltBefore = null;
+function readTilt() {
+  return tiltNow.beta == null ? null : { beta: tiltNow.beta, gamma: tiltNow.gamma, at: tiltNow.at };
+}
+async function askTiltPermission() {
+  const D = window.DeviceOrientationEvent;
+  if (D && typeof D.requestPermission === 'function') { try { await D.requestPermission(); } catch (e) { /* refused */ } }
+}
+// "Up" in the camera frame and how far the camera points down, from a reading.
+function tiltFromReading(r, source) {
+  const up = upInPhoto(upFromOrientation(r.beta, r.gamma));
+  return { up, deg: Math.asin(Math.max(-1, Math.min(1, up.z))) * 180 / Math.PI, source };
+}
+function tiltFromDeg(deg, source) { return { up: upFromPitch(deg), deg, source }; }
 
 // ---------- the depth model ----------
 
@@ -69,11 +98,13 @@ async function shrink(url) {
 }
 
 let photo = null, depth = null;
-async function usePhoto(url) {
+// sensorTilt: the tilt measured when this photo was taken, or null if unknown (a library photo).
+async function usePhoto(url, sensorTilt = null) {
   if (!estimator) { status('Pip is still learning to see. Try again in a moment.'); return; }
   status('Pip is looking at your photo...');
   say('Ooh, let me look...');
   photo = await shrink(url);
+  photo.sensorTilt = sensorTilt;
   const image = await RawImage.read(photo.url);
   const t0 = performance.now();
   depth = (await estimator(image)).depth;
@@ -108,13 +139,30 @@ function settingsNow() {
   return { size: Number($('#size').value) / 100, depthAmt: Number($('#depthAmt').value) / 100 };
 }
 
+// Which tilt to use: the sensor's (default), one set by hand, or none (the old guess).
+function effectiveTilt() {
+  const m = $('#tiltMode').value;
+  if (m === 'off') return null;
+  if (m === 'manual') return tiltFromDeg(Number($('#tiltDeg').value), 'hand setting');
+  return photo.sensorTilt;
+}
+
 function buildStage() {
   const { size, depthAmt } = settingsNow();
   const cam = makeCamera(photo.w, photo.h);
   const far = DEFAULTS.near + (DEFAULTS.far - DEFAULTS.near) * depthAmt;
   surface = createSurface(depth, cam, { near: DEFAULTS.near, far });
+
+  // With the camera's tilt, solve the depth shift so the floor faces up (see photo-geom.js).
+  tech.tilt = effectiveTilt();
+  tech.cal = null;
+  if (tech.tilt) {
+    tech.cal = calibrateShift(fitDispPlane(surface), tech.tilt.up);
+    if (tech.cal.ok) surface = createSurface(depth, cam, { shift: tech.cal.shift, scale: tech.cal.scale });
+  }
   tech.floor = fitFloor(surface);
-  frame = floorFrame(tech.floor.n);
+  // gravity is the better "up" when we have it; otherwise the fitted floor
+  frame = floorFrame(tech.cal && tech.cal.ok ? tech.tilt.up : tech.floor.n);
 
   // clear the old stage
   [mesh, floorGroup].forEach((o) => { if (o) scene.remove(o); });
@@ -263,11 +311,11 @@ function rampTap(px) {
     const climb = pathTo(ramp.bottomPx, ramp.topPx, 16);
     hopAlong(climb, { hopSec: 0.5 }, () => {
       pipPx = ramp.topPx;
-      const a = climb[0], b = climb[climb.length - 1];
       ramp.hops = climb.length - 1;
-      ramp.bottom = a; ramp.top = b;
-      ramp.rise = b.y - a.y;
-      ramp.run = Math.hypot(b.x - a.x, b.z - a.z);
+      // slope numbers: bottom on the floor, top from depth (Pip's hops still follow the photo)
+      const m = rampFromPhotoTaps(surface, tech.floor, frame.up, ramp.bottomPx, ramp.topPx);
+      if (m.ok) { ramp.rise = m.rise; ramp.run = m.run; }
+      else { const a = climb[0], b = climb[climb.length - 1]; ramp.rise = b.y - a.y; ramp.run = Math.hypot(b.x - a.x, b.z - a.z); }
       say(ramp.hops + ' hops to the top! ' + (ramp.rise > 0.01 ? 'It goes up as it goes across.' : 'Hmm, that looked flat to me.'));
       mode = 'walk';
       setTag('Tap the floor to move Pip');
@@ -358,13 +406,35 @@ $('#newBtn').addEventListener('click', () => {
 $('#size').addEventListener('change', () => { if (photo) buildStage(); });
 $('#depthAmt').addEventListener('change', () => { if (photo) buildStage(); });
 $('#showDepth').addEventListener('change', applyShowDepth);
+$('#tiltMode').addEventListener('change', () => { if (photo) buildStage(); });
+$('#tiltDeg').addEventListener('input', () => { $('#tiltVal').textContent = $('#tiltDeg').value + ' deg'; });
+$('#tiltDeg').addEventListener('change', () => { if (photo && $('#tiltMode').value === 'manual') buildStage(); });
 
-['#cam', '#lib'].forEach((id) => $(id).addEventListener('change', (e) => {
+// Tilt before the camera app opens (also asks iPhone for permission, on this tap).
+$('label[for=cam]').addEventListener('click', () => { askTiltPermission(); tiltBefore = readTilt(); });
+$('#cam').addEventListener('change', async (e) => {
   const f = e.target.files && e.target.files[0];
-  if (f) usePhoto(URL.createObjectURL(f)).catch(fail);
   e.target.value = '';
-}));
-$('#sample').addEventListener('click', () => usePhoto('sample-ramp.jpg').catch(fail));
+  if (!f) return;
+  // give the sensor a moment to report again now the page is back
+  const back = performance.now();
+  await new Promise((r) => setTimeout(r, 600));
+  const after = readTilt();
+  const r = after && after.at > back ? after : tiltBefore;
+  let tilt = r ? tiltFromReading(r, 'phone sensor') : null;
+  if (tilt && tiltBefore && after && after.at > back) {
+    const moved = Math.abs(after.beta - tiltBefore.beta) + Math.abs(after.gamma - tiltBefore.gamma);
+    if (moved > 8) tilt.source = 'phone sensor (phone moved, keep it on the stand)';
+  }
+  usePhoto(URL.createObjectURL(f), tilt).catch(fail);
+});
+$('#lib').addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if (f) usePhoto(URL.createObjectURL(f), null).catch(fail); // tilt unknown for older photos
+});
+// the sample was rendered by a camera tilted down about 33 degrees
+$('#sample').addEventListener('click', () => usePhoto('sample-ramp.jpg', tiltFromDeg(33, 'the sample\'s camera')).catch(fail));
 function fail(err) { status('Something went wrong: ' + (err && err.message ? err.message : err), 'err'); console.error(err); }
 
 // ---------- per frame ----------
@@ -406,5 +476,8 @@ loadModel().catch(fail);
 // For headless tests.
 window.__stage = {
   usePhoto, tapPixel, get ready() { return !!estimator; }, get mode() { return mode; }, get busy() { return !!hopRun || !!carRun; },
-  get ramp() { return ramp; }, get pipPx() { return pipPx; }, tech, ghostCar, frames(n = 1) { for (let i = 0; i < n; i++) step(); }
+  get ramp() { return ramp; }, get pipPx() { return pipPx; }, tech, ghostCar,
+  // height above the floor (metres, in Pip's frame) at a photo pixel
+  heightAt(px, py) { return local(surface.point(px, py)).y - local(surface.point(photo.w * 0.5, photo.h * 0.95)).y; },
+  dispAt(px, py) { return surface.dispAt(px, py); }, frames(n = 1) { for (let i = 0; i < n; i++) step(); }
 };

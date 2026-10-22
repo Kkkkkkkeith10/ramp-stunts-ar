@@ -2,9 +2,11 @@
 // Pure functions with plain {x, y, z} points, so they run in Node tests without three.js.
 //
 // Camera frame (as in three.js): the camera is at the origin looking down -z, x is right,
-// y is up in the image. Depth Anything gives relative disparity (near = big), not metres, so
-// distances are a guess: disparity is mapped onto 1/near .. 1/far. Shapes look right; true
-// sizes need a known length (books or a shoe) to scale them.
+// y is up in the image. Depth Anything gives relative disparity d (near = big): the true
+// inverse distance is scale * (d + shift), with both unknown. Angles depend only on the shift.
+// Without help, d is mapped onto a guessed 1/near .. 1/far range, which flattens slopes.
+// With the phone's tilt at photo time (gravity in the camera frame), the shift is solved so the
+// fitted floor faces up (see calibrateShift). The scale then only sets sizes, not angles.
 
 export const DEFAULTS = { hfovDeg: 66, near: 0.5, far: 4 };
 
@@ -29,12 +31,18 @@ export function normalizeDisparity(values, lo = 0.02, hi = 0.98) {
 }
 
 // depth: { data, width, height, channels } as returned by the depth model (0..255, near = bright).
-export function createSurface(depth, cam, { near = DEFAULTS.near, far = DEFAULTS.far, normalize = true } = {}) {
+// Mapping: either a guessed near/far range, or a calibrated { shift, scale } where
+// 1 / distance = scale * (d + shift). Distances are capped at maxDist.
+export function createSurface(depth, cam, { near = DEFAULTS.near, far = DEFAULTS.far, normalize = true, shift = null, scale = null, maxDist = 30 } = {}) {
   const { width: w, height: h, channels = 1 } = depth;
   const raw = new Float32Array(w * h);
   for (let i = 0; i < w * h; i++) raw[i] = depth.data[i * channels] / 255;
   const disp = normalize ? normalizeDisparity(raw) : raw;
   const sx = cam.w / w, sy = cam.h / h;
+  const calibrated = shift != null && scale != null;
+  const distance = calibrated
+    ? (d) => 1 / Math.max(1 / maxDist, scale * (d + shift))
+    : (d) => disparityToDistance(d, near, far);
 
   function dispAt(px, py) {
     // bilinear lookup; px, py are in photo pixels
@@ -44,14 +52,90 @@ export function createSurface(depth, cam, { near = DEFAULTS.near, far = DEFAULTS
     return (disp[i] * (1 - fx) + disp[i + 1] * fx) * (1 - fy) + (disp[i + w] * (1 - fx) + disp[i + w + 1] * fx) * fy;
   }
   function point(px, py) {
-    const z = disparityToDistance(dispAt(px, py), near, far);
+    const z = distance(dispAt(px, py));
     return { x: (px - cam.cx) / cam.fx * z, y: -(py - cam.cy) / cam.fy * z, z: -z };
   }
   function pixelOf(p) {
     const z = -p.z;
     return [p.x / z * cam.fx + cam.cx, -p.y / z * cam.fy + cam.cy];
   }
-  return { cam, w, h, disp, dispAt, point, pixelOf };
+  return { cam, w, h, disp, dispAt, point, pixelOf, calibrated };
+}
+
+// ---------- calibration from the phone's tilt ----------
+
+// "Up" in the phone's own frame (x right, y to the top of the screen, z out of the screen)
+// from DeviceOrientation beta and gamma, in degrees. For the back camera held in portrait this
+// is also "up" in the camera frame. Upright phone: (0, 1, 0). Flat on its back: (0, 0, 1).
+export function upFromOrientation(betaDeg, gammaDeg) {
+  const b = betaDeg * Math.PI / 180, g = gammaDeg * Math.PI / 180;
+  return { x: -Math.sin(g) * Math.cos(b), y: Math.sin(b), z: Math.cos(g) * Math.cos(b) };
+}
+
+// The photo shown upright (EXIF applied) may be the phone turned sideways. Turn "up" in steps
+// of 90 degrees about the camera axis to whichever way points most to the top of the photo.
+export function upInPhoto(up) {
+  const turns = [
+    { x: up.x, y: up.y }, { x: -up.y, y: up.x }, { x: -up.x, y: -up.y }, { x: up.y, y: -up.x }
+  ];
+  let best = turns[0];
+  turns.forEach((t) => { if (t.y > best.y) best = t; });
+  return { x: best.x, y: best.y, z: up.z };
+}
+
+// "Up" for a camera tilted down by `deg` (no roll): the manual fallback.
+export function upFromPitch(deg) {
+  const p = deg * Math.PI / 180;
+  return { x: 0, y: Math.cos(p), z: Math.sin(p) };
+}
+
+// The floor in disparity space. For any plane, disparity is a linear function of the normalized
+// image coordinates: d = a * xn + b * yn + g, whatever the unknown shift and scale. RANSAC over
+// the lower part of the photo finds it, and returns the floor samples' disparities too.
+export function fitDispPlane(surface, { fromRow = 0.55, samples = 900, iters = 300, seed = 11, tol = 0.012 } = {}) {
+  const { cam } = surface, rand = rng(seed), pts = [];
+  for (let i = 0; i < samples; i++) {
+    const px = rand() * cam.w, py = (fromRow + rand() * (1 - fromRow)) * cam.h;
+    pts.push({ xn: (px - cam.cx) / cam.fx, yn: -(py - cam.cy) / cam.fy, d: surface.dispAt(px, py) });
+  }
+  let best = null;
+  for (let k = 0; k < iters; k++) {
+    const p = [0, 1, 2].map(() => pts[Math.floor(rand() * pts.length)]);
+    // solve d = a xn + b yn + g through three samples (Cramer's rule)
+    const m = p.map((q) => [q.xn, q.yn, 1]), det = det3(m);
+    if (Math.abs(det) < 1e-9) continue;
+    const r = p.map((q) => q.d);
+    const a = det3(m.map((row, i) => [r[i], row[1], row[2]])) / det;
+    const b = det3(m.map((row, i) => [row[0], r[i], row[2]])) / det;
+    const g = det3(m.map((row, i) => [row[0], row[1], r[i]])) / det;
+    const inl = pts.filter((q) => Math.abs(a * q.xn + b * q.yn + g - q.d) < tol);
+    if (!best || inl.length > best.inl.length) best = { a, b, g, inl };
+  }
+  if (!best) return { ok: false, share: 0 };
+  return { a: best.a, b: best.b, g: best.g, share: best.inl.length / pts.length, ok: best.inl.length / pts.length > 0.3, floorD: best.inl.map((q) => q.d) };
+}
+function det3(m) {
+  return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+}
+
+// Solve the disparity shift so the floor faces "up". With 1/z = scale * (d + shift), the floor's
+// normal in the camera frame is proportional to (a, b, -(g + shift)); it must be parallel to up,
+// pointing the other way (the floor is below). The scale is set so the floor's middle distance
+// is `floorDistance` metres: sizes are still a guess, angles are not.
+export function calibrateShift(plane, up, { floorDistance = 1 } = {}) {
+  if (!plane.ok) return { ok: false, reason: 'no_floor' };
+  const h2 = up.x * up.x + up.y * up.y;
+  if (h2 < 0.02) return { ok: false, reason: 'straight_down' };
+  const lambda = (plane.a * up.x + plane.b * up.y) / h2;
+  if (lambda >= 0) return { ok: false, reason: 'floor_upside_down' };
+  const shift = -lambda * up.z - plane.g;
+  const vals = plane.floorD.map((d) => d + shift).sort((p, q) => p - q);
+  if (vals[0] <= 1e-4) return { ok: false, reason: 'behind_camera', shift };
+  const mid = vals[Math.floor(vals.length / 2)];
+  // how well the floor's own tilt (left-right) agrees with the sensor's roll: 0 = perfect
+  const n = norm({ x: plane.a, y: plane.b, z: -(plane.g + shift) }), u = norm(up);
+  const mismatchDeg = Math.acos(Math.min(1, Math.abs(dot(n, u)))) * 180 / Math.PI;
+  return { ok: true, shift, scale: 1 / (floorDistance * mid), mismatchDeg };
 }
 
 const sub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z });
@@ -125,4 +209,23 @@ export function surfacePath(surface, a, b, step = 0.06, fine = 120) {
     else out.push(last);
   }
   return out;
+}
+
+// The ramp's slope from two taps. Depth models can misjudge a thin, plain tray (one render read
+// it as a flat board floating above the floor), so the bottom is not taken from depth: a ramp's
+// bottom touches the floor, so it is where the line through the bottom tap meets the floor
+// plane. The top comes from depth. `floor` is { n, d } with n . p + d = 0, `up` is gravity's up.
+export function rampFromPhotoTaps(surface, floor, up, bottomPx, topPx) {
+  const { cam } = surface;
+  const r = { x: (bottomPx[0] - cam.cx) / cam.fx, y: -(bottomPx[1] - cam.cy) / cam.fy, z: -1 };
+  const den = dot(floor.n, r);
+  if (Math.abs(den) < 1e-6) return { ok: false, reason: 'parallel' };
+  const t = -floor.d / den;
+  if (t <= 0) return { ok: false, reason: 'floor_behind' };
+  const foot = { x: r.x * t, y: r.y * t, z: r.z * t };
+  const top = surface.point(topPx[0], topPx[1]);
+  const v = sub(top, foot), u = norm(up);
+  const rise = dot(v, u);
+  const run = Math.sqrt(Math.max(0, dot(v, v) - rise * rise));
+  return { ok: true, foot, top, rise, run, angleDeg: Math.atan2(rise, run) * 180 / Math.PI };
 }
