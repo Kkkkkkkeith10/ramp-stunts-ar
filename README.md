@@ -1,5 +1,7 @@
 # Ramp Stunts AR (phase 1 prototype)
 
+Live: https://kkkkkkkeith10.github.io/ramp-stunts-ar/ (repo: https://github.com/Kkkkkkkeith10/ramp-stunts-ar)
+
 Pip stands on the real floor, climbs the real ramp, bets with a ghost car, and hops along the ramp to count it. WebXR in Android Chrome, built with three.js 0.160.0 (vendored in `vendor/`, MIT licence). No backend, no build step.
 
 ## What it does
