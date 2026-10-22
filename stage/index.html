@@ -42,6 +42,11 @@ label.slider { display: grid; grid-template-columns: 7.5em 1fr; gap: 10px; align
 input[type=range] { width: 100%; accent-color: var(--accent); }
 details summary { cursor: pointer; color: var(--muted); min-height: 40px; display: flex; align-items: center; }
 details[open] { display: grid; gap: 8px; }
+.books { display: grid; gap: 8px; padding: 10px; border-radius: 12px; border: 2px solid var(--repeat); }
+.stepper { display: grid; grid-template-columns: auto auto auto 1fr; gap: 10px; align-items: center; }
+.stepper b { font-size: 26px; min-width: 2ch; text-align: center; font-variant-numeric: tabular-nums; }
+.stepper .btn.alt { min-width: 48px; font-size: 22px; padding: 6px; }
+input[type=number] { font: inherit; padding: 6px 8px; border-radius: 10px; border: 2px solid var(--line); background: var(--bg); color: var(--ink); width: 100%; }
 #tech { font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; color: var(--muted); word-break: break-word; }
 a { color: inherit; }
 </style>
@@ -77,6 +82,15 @@ a { color: inherit; }
       <button class="btn" id="rampBtn">Show Pip the ramp</button>
       <button class="btn alt" id="carBtn" disabled>Pip's ghost car</button>
     </div>
+    <div class="books" id="booksBox" hidden>
+      <p><b>How many books high is the top of your ramp?</b></p>
+      <div class="stepper">
+        <button class="btn alt" id="booksMinus" aria-label="Fewer books">-</button>
+        <b id="booksVal">3</b>
+        <button class="btn alt" id="booksPlus" aria-label="More books">+</button>
+        <button class="btn" id="booksBtn">Tell Pip</button>
+      </div>
+    </div>
     <div class="row">
       <button class="btn alt" id="homeBtn">Back to the photo view</button>
       <button class="btn alt" id="newBtn">New photo</button>
@@ -84,6 +98,8 @@ a { color: inherit; }
     <p class="muted small">Drag to tilt the stage. Tap to move Pip. Nearer real things hide him.</p>
     <details>
       <summary>Grown-up settings and tech info</summary>
+      <label class="slider">One book (cm) <input id="bookCm" type="number" min="0.5" max="8" step="0.5" inputmode="decimal"></label>
+      <label class="slider">Shoe (cm) <input id="shoeCm" type="number" min="10" max="35" step="0.5" inputmode="decimal"></label>
       <label class="slider">Pip size <input id="size" type="range" min="40" max="250" value="100"></label>
       <label class="slider">Camera tilt <select id="tiltMode"><option value="auto">From the phone sensor</option><option value="manual">Set by hand</option><option value="off">Off (old guess)</option></select></label>
       <label class="slider">Tilt down <span><input id="tiltDeg" type="range" min="0" max="85" value="30"> <span id="tiltVal">30 deg</span></span></label>

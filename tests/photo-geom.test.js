@@ -156,3 +156,31 @@ test('ramp from photo taps: the bottom comes from the floor, the top from depth'
   // the foot really is on the floor
   near(r.foot.x * floor.n.x + r.foot.y * floor.n.y + r.foot.z * floor.n.z + floor.d, 0, 1e-9);
 });
+
+test('distScale resizes the stage about the camera: same pixels, same angles', () => {
+  const cam = makeCamera(200, 150);
+  const depth = floorDepth(200, 150, 35, cam);
+  const a = createSurface(depth, cam, { normalize: false }), b = createSurface(depth, cam, { normalize: false, distScale: 2 });
+  const pa = a.point(120, 110), pb = b.point(120, 110);
+  near(pb.x, 2 * pa.x); near(pb.y, 2 * pa.y); near(pb.z, 2 * pa.z);
+  const px = b.pixelOf(pb); near(px[0], 120, 1e-6); near(px[1], 110, 1e-6);
+});
+
+test('scale from books: the ramp comes out the real size', async () => {
+  const { scaleFromBooks, rampFromPhotoTaps } = await import('../js/photo-geom.js');
+  assert.equal(scaleFromBooks(0.001, 3, 2.5).reason, 'flat');
+  assert.equal(scaleFromBooks(0.1, 0, 2.5).reason, 'no_books');
+  near(scaleFromBooks(0.15, 3, 2.5).k, 0.5);
+  // the synthetic room: 3 books of 2.5 cm, a ramp 40 cm across
+  const cam = makeCamera(320, 240), up = upFromPitch(33), room = rampRoom(320, 240, 33, cam);
+  const cal = calibrateShift(fitDispPlane(createSurface(room.depth, cam)), up);
+  const s1 = createSurface(room.depth, cam, { shift: cal.shift, scale: cal.scale });
+  const r1 = rampFromPhotoTaps(s1, fitFloor(s1), up, room.footPx, room.topPx);
+  const k = scaleFromBooks(r1.rise, 3, 2.5);
+  assert.ok(k.ok, k.reason);
+  const s2 = createSurface(room.depth, cam, { shift: cal.shift, scale: cal.scale, distScale: k.k });
+  const r2 = rampFromPhotoTaps(s2, fitFloor(s2), up, room.footPx, room.topPx);
+  near(r2.rise, 0.075, 0.003);
+  near(r2.run, 0.40, 0.04);
+  near(r2.angleDeg, r1.angleDeg, 0.3);
+});

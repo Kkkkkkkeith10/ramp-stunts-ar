@@ -8,8 +8,9 @@ import { THREE, makePip, applyPipPose, makeCar, placeCar, makeLabel } from './sc
 import { createPip, play, pose, settle } from './pip-anim.js';
 import {
   makeCamera, createSurface, fitFloor, floorFrame, surfacePath, DEFAULTS,
-  upFromOrientation, upInPhoto, upFromPitch, fitDispPlane, calibrateShift, rampFromPhotoTaps
+  upFromOrientation, upInPhoto, upFromPitch, fitDispPlane, calibrateShift, rampFromPhotoTaps, scaleFromBooks
 } from './photo-geom.js';
+import { plural, ratioText } from './rules.js';
 import { pipeline, env, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
 
 const $ = (s) => document.querySelector(s);
@@ -105,6 +106,7 @@ async function usePhoto(url, sensorTilt = null) {
   say('Ooh, let me look...');
   photo = await shrink(url);
   photo.sensorTilt = sensorTilt;
+  worldScale = { k: 1, fromBooks: false, books: 0 };
   const image = await RawImage.read(photo.url);
   const t0 = performance.now();
   depth = (await estimator(image)).depth;
@@ -135,6 +137,22 @@ let pipA = null, pipPx = null, hopRun = null, carRun = null, ramp = null, mode =
 const view = { yaw: 0, pitch: 0, pivot: new THREE.Vector3(0, 0, -1.5) };
 const labels = [];
 
+// The stage's size factor: 1 = the guess (floor about 1 m away); set from the child's books.
+let worldScale = { k: 1, fromBooks: false, books: 0 };
+
+// Book thickness and shoe length, shared with the AR app on this phone (same storage key).
+function loadSizes() {
+  const s = { bookCm: 2.5, shoeCm: 18 };
+  try { Object.assign(s, JSON.parse(localStorage.getItem('rsar-settings') || '{}')); } catch (e) { /* private mode */ }
+  return s;
+}
+function saveSizes(patch) {
+  try {
+    const all = JSON.parse(localStorage.getItem('rsar-settings') || '{}');
+    localStorage.setItem('rsar-settings', JSON.stringify({ ...all, ...patch }));
+  } catch (e) { /* ignore */ }
+}
+
 function settingsNow() {
   return { size: Number($('#size').value) / 100, depthAmt: Number($('#depthAmt').value) / 100 };
 }
@@ -147,18 +165,19 @@ function effectiveTilt() {
   return photo.sensorTilt;
 }
 
-function buildStage() {
+// keep: { pipPx, ramp: { bottomPx, topPx, hops } } to rebuild without the drop-in (after resizing).
+function buildStage(keep = null) {
   const { size, depthAmt } = settingsNow();
   const cam = makeCamera(photo.w, photo.h);
   const far = DEFAULTS.near + (DEFAULTS.far - DEFAULTS.near) * depthAmt;
-  surface = createSurface(depth, cam, { near: DEFAULTS.near, far });
+  surface = createSurface(depth, cam, { near: DEFAULTS.near, far, distScale: worldScale.k });
 
   // With the camera's tilt, solve the depth shift so the floor faces up (see photo-geom.js).
   tech.tilt = effectiveTilt();
   tech.cal = null;
   if (tech.tilt) {
     tech.cal = calibrateShift(fitDispPlane(surface), tech.tilt.up);
-    if (tech.cal.ok) surface = createSurface(depth, cam, { shift: tech.cal.shift, scale: tech.cal.scale });
+    if (tech.cal.ok) surface = createSurface(depth, cam, { shift: tech.cal.shift, scale: tech.cal.scale, distScale: worldScale.k });
   }
   tech.floor = fitFloor(surface);
   // gravity is the better "up" when we have it; otherwise the fitted floor
@@ -212,16 +231,25 @@ function buildStage() {
   view.yaw = 0; view.pitch = 0;
   sizeCanvas();
 
-  // Pip drops in near the bottom middle of the photo, on the floor
-  pipPx = [photo.w * 0.5, photo.h * 0.86];
+  // Pip drops in near the bottom middle of the photo, on the floor (or stays put after resizing)
+  pipPx = keep ? keep.pipPx : [photo.w * 0.5, photo.h * 0.86];
   const land = local(surface.point(pipPx[0], pipPx[1]));
   pipA = createPip(land);
   const cam0 = local({ x: 0, y: 0, z: 0 });
   pipModel.rotation.y = Math.atan2(cam0.x - land.x, cam0.z - land.z); // start facing the child
-  const up = 0.35 * size;
-  hopAlong([{ x: land.x, y: land.y + up, z: land.z }, land], { hopSec: 0.55, hopHeight: 0 }, () => say("Wheee! I'm in your photo! Tap the floor and I'll hop there."));
   mode = 'walk';
   setTag('Tap the floor to move Pip');
+  $('#booksBox').hidden = true;
+  if (keep && keep.ramp) {
+    ramp = { ...keep.ramp };
+    marker(local(surface.point(...ramp.bottomPx)), 0x0B7A85);
+    marker(local(surface.point(...ramp.topPx)), 0xD9A400);
+    measureRamp();
+    $('#carBtn').disabled = false;
+    return;
+  }
+  const up = 0.35 * size;
+  hopAlong([{ x: land.x, y: land.y + up, z: land.z }, land], { hopSec: 0.55, hopHeight: 0 }, () => say("Wheee! I'm in your photo! Tap the floor and I'll hop there."));
   showTech();
 }
 
@@ -312,25 +340,49 @@ function rampTap(px) {
     hopAlong(climb, { hopSec: 0.5 }, () => {
       pipPx = ramp.topPx;
       ramp.hops = climb.length - 1;
-      // slope numbers: bottom on the floor, top from depth (Pip's hops still follow the photo)
-      const m = rampFromPhotoTaps(surface, tech.floor, frame.up, ramp.bottomPx, ramp.topPx);
-      if (m.ok) { ramp.rise = m.rise; ramp.run = m.run; }
-      else { const a = climb[0], b = climb[climb.length - 1]; ramp.rise = b.y - a.y; ramp.run = Math.hypot(b.x - a.x, b.z - a.z); }
-      say(ramp.hops + ' hops to the top! ' + (ramp.rise > 0.01 ? 'It goes up as it goes across.' : 'Hmm, that looked flat to me.'));
+      measureRamp();
+      say(ramp.hops + ' hops to the top! ' + (ramp.rise > 0.01 ? 'How many books high is it?' : 'Hmm, that looked flat to me.'));
       mode = 'walk';
       setTag('Tap the floor to move Pip');
       $('#carBtn').disabled = false;
-      showTech();
-      $('#tech').textContent += ' Ramp guess: ' + Math.round(ramp.run * 100) + ' cm across, ' + Math.round(ramp.rise * 100) + ' cm up, ' +
-        Math.round(Math.atan2(ramp.rise, ramp.run) * 180 / Math.PI) + ' degrees (scale is a guess).';
+      $('#booksBox').hidden = !(ramp.rise > 0.005);
     }, (k) => addLabel(String(k), climb[k]));
   });
+}
+
+// Slope numbers: the bottom on the floor, the top from depth (Pip's hops follow the photo).
+function measureRamp() {
+  const m = rampFromPhotoTaps(surface, tech.floor, frame.up, ramp.bottomPx, ramp.topPx);
+  if (m.ok) { ramp.rise = m.rise; ramp.run = m.run; }
+  else {
+    const a = local(surface.point(...ramp.bottomPx)), b = local(surface.point(...ramp.topPx));
+    ramp.rise = b.y - a.y; ramp.run = Math.hypot(b.x - a.x, b.z - a.z);
+  }
+  showTech();
+  $('#tech').textContent += ' Ramp: ' + Math.round(ramp.run * 100) + ' cm across, ' + Math.round(ramp.rise * 100) + ' cm up, ' +
+    Math.round(Math.atan2(ramp.rise, ramp.run) * 180 / Math.PI) + ' degrees' +
+    (worldScale.fromBooks ? ' (sized from ' + plural(worldScale.books, 'book') + ').' : ' (sizes are a guess until you tell Pip the books).');
+}
+
+// The child's book count sets the real size: rebuild the stage scaled about the camera, so the
+// photo view, Pip's spot and the ramp taps all stay where they are.
+function applyBooks() {
+  const books = Number($('#booksVal').textContent), s = loadSizes();
+  const r = scaleFromBooks(ramp.rise, books, s.bookCm);
+  if (!r.ok) { say('Hmm, I could not work that out. Try showing me the ramp again.'); return; }
+  worldScale = { k: worldScale.k * r.k, fromBooks: true, books };
+  const keep = { pipPx, ramp: { bottomPx: ramp.bottomPx, topPx: ramp.topPx, hops: ramp.hops } };
+  buildStage(keep);
+  const across = Math.max(1, Math.round(ramp.run * 100 / s.shoeCm));
+  ramp.books = books; ramp.across = across;
+  $('#booksBox').hidden = true;
+  say('Now I know how big it is! ' + ratioText(books, across) + '.');
 }
 
 // ---------- Pip's ghost car: down the ramp and along the floor beyond it ----------
 
 function ghostCar() {
-  if (!ramp || !ramp.top || carRun) return;
+  if (!ramp || !ramp.topPx || ramp.hops == null || carRun) return;
   const { size } = settingsNow();
   // keep going past the bottom, the same way, for twice the ramp's length (in the photo)
   const dx = ramp.bottomPx[0] - ramp.topPx[0], dy = ramp.bottomPx[1] - ramp.topPx[1];
@@ -394,6 +446,7 @@ function setTag(t) { $('#tag').textContent = t; }
 $('#rampBtn').addEventListener('click', () => {
   if (hopRun) return;
   mode = 'rampBottom';
+  $('#booksBox').hidden = true;
   setTag('Tap the bottom of the ramp');
   say('Show me your ramp! Tap the bottom first.');
 });
@@ -407,6 +460,15 @@ $('#size').addEventListener('change', () => { if (photo) buildStage(); });
 $('#depthAmt').addEventListener('change', () => { if (photo) buildStage(); });
 $('#showDepth').addEventListener('change', applyShowDepth);
 $('#tiltMode').addEventListener('change', () => { if (photo) buildStage(); });
+$('#booksMinus').addEventListener('click', () => { $('#booksVal').textContent = Math.max(1, Number($('#booksVal').textContent) - 1); });
+$('#booksPlus').addEventListener('click', () => { $('#booksVal').textContent = Math.min(12, Number($('#booksVal').textContent) + 1); });
+$('#booksBtn').addEventListener('click', applyBooks);
+{
+  const s = loadSizes();
+  $('#bookCm').value = s.bookCm; $('#shoeCm').value = s.shoeCm;
+  $('#bookCm').addEventListener('change', () => saveSizes({ bookCm: Math.min(8, Math.max(0.5, Number($('#bookCm').value) || 2.5)) }));
+  $('#shoeCm').addEventListener('change', () => saveSizes({ shoeCm: Math.min(35, Math.max(10, Number($('#shoeCm').value) || 18)) }));
+}
 $('#tiltDeg').addEventListener('input', () => { $('#tiltVal').textContent = $('#tiltDeg').value + ' deg'; });
 $('#tiltDeg').addEventListener('change', () => { if (photo && $('#tiltMode').value === 'manual') buildStage(); });
 

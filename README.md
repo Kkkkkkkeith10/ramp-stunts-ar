@@ -17,7 +17,9 @@ One photo, no tracking. Depth Anything V2 Small (Apache-2.0, via Transformers.js
   1. *Tilt calibration:* the phone's tilt (DeviceOrientation) is read just before and after the camera app opens. Gravity tells us how the floor should face, which solves the depth shift (`calibrateShift`). Library photos have no tilt; "Grown-up settings" lets you set it by hand.
   2. *The bottom touches the floor:* the slope uses the floor plane under the bottom tap, and depth only for the top (`rampFromPhotoTaps`). On the sample render, the model read the plain grey tray as a flat board 10 cm above the floor, so this rule mattered most.
 - Results on the sample (true slope 10.6 degrees): 9.0 with the right tilt, 9.3 with no tilt, 8.2 to 9.7 with the tilt 8 degrees off; it read 1 degree before these fixes. In a synthetic test with the camera looking 50 degrees down, calibration corrected 16.3 to 10.7.
-- **Still a guess:** sizes in cm (the floor is assumed to be about 1 m away; the sample's 40 cm ramp reads 71 cm). The child's book count could fix the scale next. Not yet checked: real photos, real phones, and whether every phone's sensor and camera app agree on "up".
+- **Sizes from the book count.** Before the child answers, sizes assume the floor is about 1 m away (the sample's 40 cm ramp read 71 cm). After Pip climbs, he asks how many books high the top is; books x book thickness is the real height, and the whole stage is rescaled about the camera (`scaleFromBooks`, `distScale`), so the photo view, Pip's spot and the taps stay put. Pip then says the ramp in game units ("3 books up for every 3 shoes across"). Book thickness and shoe length are in "Grown-up settings" and shared with the AR app on the same phone.
+- Sample result after "3 books": 7.5 cm up, 47 cm across (real: 7.5 and 40), 9 degrees. The across error comes from the slope error, so Pip said 3 shoes where the real ramp is about 2.
+- Not yet checked: real photos, real phones, and whether every phone's sensor and camera app agree on "up".
 
 `depth/` is the plain depth test: photo, depth map and a tiltable 3D version.
 

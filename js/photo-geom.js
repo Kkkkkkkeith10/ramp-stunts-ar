@@ -33,7 +33,9 @@ export function normalizeDisparity(values, lo = 0.02, hi = 0.98) {
 // depth: { data, width, height, channels } as returned by the depth model (0..255, near = bright).
 // Mapping: either a guessed near/far range, or a calibrated { shift, scale } where
 // 1 / distance = scale * (d + shift). Distances are capped at maxDist.
-export function createSurface(depth, cam, { near = DEFAULTS.near, far = DEFAULTS.far, normalize = true, shift = null, scale = null, maxDist = 30 } = {}) {
+// distScale multiplies every distance: scaling about the camera keeps the photo view the same
+// and leaves angles alone, so it only fixes real sizes (see scaleFromBooks).
+export function createSurface(depth, cam, { near = DEFAULTS.near, far = DEFAULTS.far, normalize = true, shift = null, scale = null, maxDist = 30, distScale = 1 } = {}) {
   const { width: w, height: h, channels = 1 } = depth;
   const raw = new Float32Array(w * h);
   for (let i = 0; i < w * h; i++) raw[i] = depth.data[i * channels] / 255;
@@ -52,7 +54,7 @@ export function createSurface(depth, cam, { near = DEFAULTS.near, far = DEFAULTS
     return (disp[i] * (1 - fx) + disp[i + 1] * fx) * (1 - fy) + (disp[i + w] * (1 - fx) + disp[i + w + 1] * fx) * fy;
   }
   function point(px, py) {
-    const z = distance(dispAt(px, py));
+    const z = distance(dispAt(px, py)) * distScale;
     return { x: (px - cam.cx) / cam.fx * z, y: -(py - cam.cy) / cam.fy * z, z: -z };
   }
   function pixelOf(p) {
@@ -228,4 +230,14 @@ export function rampFromPhotoTaps(surface, floor, up, bottomPx, topPx) {
   const rise = dot(v, u);
   const run = Math.sqrt(Math.max(0, dot(v, v) - rise * rise));
   return { ok: true, foot, top, rise, run, angleDeg: Math.atan2(rise, run) * 180 / Math.PI };
+}
+
+// Real sizes from the child's own count: the ramp's top is `books` books high, each `bookCm`
+// thick. Returns the factor to multiply all distances by (pass it as distScale), or why not.
+export function scaleFromBooks(measuredRiseM, books, bookCm, { minRiseM = 0.005, minK = 0.05, maxK = 20 } = {}) {
+  if (!(books > 0) || !(bookCm > 0)) return { ok: false, reason: 'no_books' };
+  if (!(measuredRiseM > minRiseM)) return { ok: false, reason: 'flat' };
+  const k = (books * bookCm / 100) / measuredRiseM;
+  if (k < minK || k > maxK) return { ok: false, reason: 'out_of_range', k };
+  return { ok: true, k };
 }
